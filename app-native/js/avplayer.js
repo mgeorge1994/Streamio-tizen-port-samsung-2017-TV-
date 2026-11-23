@@ -13,6 +13,7 @@
   function AvPlayer(container) {
     var self = this, av = api(), handlers = {}, durMs = 0, curMs = 0, url = '';
     var prepared = false, wantPlay = false, destroyed = false;
+    var rate = 1, volume = 1, muted = false;
     self.isAvPlay = true;
     self.paused = true;
     self.readyState = 0;
@@ -52,6 +53,30 @@
     Object.defineProperty(self, 'currentTime', {
       get: function () { return curMs / 1000; },
       set: function (sec) { seek(sec); }
+    });
+    // Same 0..1 / muted interface as <video>, bridged to AVPlay where available.
+    Object.defineProperty(self, 'playbackRate', {
+      get: function () { return rate; },
+      set: function (r) {
+        r = Number(r) || 1;
+        rate = r < 0.25 ? 0.25 : (r > 2 ? 2 : r);
+        try { if (av && av.setPlaybackRate) av.setPlaybackRate(rate); } catch (e) {}
+      }
+    });
+    Object.defineProperty(self, 'volume', {
+      get: function () { return volume; },
+      set: function (v) {
+        v = Number(v);
+        volume = isNaN(v) ? 1 : Math.max(0, Math.min(1, v));
+        try { if (av && av.setVolume) av.setVolume(Math.round(volume * 100)); } catch (e) {}
+      }
+    });
+    Object.defineProperty(self, 'muted', {
+      get: function () { return muted; },
+      set: function (v) {
+        muted = !!v;
+        try { if (av && av.setMute) av.setMute(muted); } catch (e) {}
+      }
     });
 
     function listener() {

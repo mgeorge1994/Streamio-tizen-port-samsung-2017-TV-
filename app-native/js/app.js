@@ -543,15 +543,21 @@ var App = (function () {
   var player = null, currentStream = null, osdTimer = null, osdVisible = true;
   var playerData = null, seekEl = null, fillEl = null, playing = false;
   var seekKeyupHandler = null, clearSeekTimer = null;
+  // Hardware keys are routed through these hooks so they always act on the
+  // current player, even while the on-screen controller is hidden.
+  var playerToggle = null, playerJump = null, playerStop = null, playerInfo = null;
+  var playerMute = null, playerVolume = null, playerStep = null;
+  var playerMenuReturnFocus = null;
   var playerReturnFocus = null, lastLayerClose = 0;
   var subCues = [], subTracks = [], subOn = true, subUrl = '';
   var subOffset = 0, subSyncKey = '', subAutoSync = true;   // subtitle sync, seconds added to cue times
   var driftA = null, driftB = null;   // two-point drift correction: {t, o} pairs
   var saveProgressNow = null;   // set by playUrl; called on exit to store the final position
   var nextEpisodeHooks = null;  // set by playUrl: pre-load of the next episode
-  var qrTimer = null, statsTimer = null;
+  var qrTimer = null, statsTimer = null, stallTimer = null;
   function stopQrPolling() { if (qrTimer) { clearInterval(qrTimer); qrTimer = null; } }
   function stopStatsPolling() { if (statsTimer) { clearInterval(statsTimer); statsTimer = null; } }
+  function stopStallWatch() { if (stallTimer) { clearInterval(stallTimer); stallTimer = null; } }
 
   var SUB_COLORS = [
     { name: 'White', value: '#FFFFFF' },
@@ -705,7 +711,9 @@ var App = (function () {
       '<span class="pbtn" data-focus="1" data-icon="chevron_back" id="back10"><i style="background-image:' + U.icon('chevron_back') + '"></i></span>' +
       '<span class="pbtn" data-focus="1" data-icon="chevron_forward" id="fwd10"><i style="background-image:' + U.icon('chevron_forward') + '"></i></span>' +
       '<span class="pbtn" data-focus="1" data-icon="subtitles" id="subtitles"><i style="background-image:' + U.icon('subtitles') + '"></i></span>' +
-      '<span class="pbtn" data-focus="1" data-icon="audio" id="audio"><i style="background-image:' + U.icon('audio') + '"></i></span>' +
+      '<span class="pbtn" data-focus="1" data-icon="audio_tracks" id="audio"><i style="background-image:' + U.icon('audio_tracks') + '"></i></span>' +
+      '<span class="pbtn" data-focus="1" data-icon="audio" id="mute"><i style="background-image:' + U.icon('audio') + '"></i></span>' +
+      '<span class="pbtn" data-focus="1" data-icon="speed" id="speed"><i style="background-image:' + U.icon('speed') + '"></i></span>' +
       '<span class="pbtn" data-focus="1" data-icon="settings" id="quality"><i style="background-image:' + U.icon('settings') + '"></i></span>' +
       '<span class="pbtn" data-focus="1" data-icon="chevrons_forward" id="next-ep-btn"><i style="background-image:' + U.icon('chevrons_forward') + '"></i></span>' +
       '<span class="time" id="time">0:00 / 0:00</span>' +
@@ -735,6 +743,10 @@ var App = (function () {
     // Record every listener attached below, so they can be moved onto the
     // AVPlay player if the browser <video> cannot decode this stream.
     var playerListeners = [], usingAvPlay = false, lastStats = null, htmlVideo = player, srcSetAt = 0;
+    function clampRate(r) { r = Number(r) || 1; return r < 0.25 ? 0.25 : (r > 2 ? 2 : r); }
+    var playbackRate = clampRate(U.get('playbackRate', 1));
+    var currentVolume = 1, currentMuted = false;
+    try { player.playbackRate = playbackRate; } catch (e) {}
     (function (v) {
       var add = v.addEventListener;
       v.addEventListener = function (type, fn, cap) {
@@ -759,6 +771,7 @@ var App = (function () {
         av.addEventListener(playerListeners[li][0], playerListeners[li][1]);
       if (htmlVideo.parentNode) htmlVideo.parentNode.removeChild(htmlVideo);
       player = av;
+      try { av.playbackRate = playbackRate; av.volume = currentVolume; av.muted = currentMuted; } catch (e) {}
       document.documentElement.className += ' avplay-active';
       document.body.className += ' avplay-active';
       av.src = url; av.load(); av.play();
@@ -784,9 +797,9 @@ var App = (function () {
       if (scrubTimer) { clearInterval(scrubTimer); scrubTimer = null; }
       seekEl.className = seekEl.className.replace(/\s*scrubbing/g, '');
       if (!player || layer.className.indexOf('hidden') !== -1) return;
-      // Round loader as soon as the button is released.
+      // Seek commits immediately; no round overlay over a playing picture.
       seekPending = true; seekFrom = -1;
-      load.className = 'loading show';
+      hideLoadSpinner();
       try { player.currentTime = seekTarget; } catch (e) {}
       // Resume immediately at the released position: the old 1 s delay made
       // the picture look frozen after a long scrub.
@@ -801,13 +814,125 @@ var App = (function () {
     };
     var load = U.qs('#load', layer);
     var loader = U.qs('#torrent-loader', layer);
+    // The small circular spinner belongs to the FIRST load only. Torrents use
+    // the full-screen logo loader; after playback starts, nothing circular is
+    // ever painted over the picture (seek, stall, next episode, etc.).
+    function hideLoadSpinner() { load.className = 'loading'; }
+
+    // One entry point for the hardware Play/Pause key and the on-screen button.
+    // Never leave a half-finished scrub behind when toggling playback.
+    function togglePlayback() {
+      if (!player || layer.className.indexOf('hidden') !== -1) return;
+      if (scrubbing) commitSeek();
+      if (player.paused) { try { player.play(); } catch (e) {} setPpIcon('pause'); }
+      else { try { player.pause(); } catch (e) {} setPpIcon('play'); }
+      showOsd();
+    }
+    // Left/Right with the controller hidden: real -10/+10 s jump, not just a
+    // cursor move. Resume so the picture never looks frozen after the seek.
+    function jumpBy(sec) {
+      if (!player || layer.className.indexOf('hidden') !== -1) return;
+      if (scrubbing) commitSeek();
+      var d = player.duration, t = (player.currentTime || 0) + sec;
+      if (t < 0) t = 0;
+      if (d && isFinite(d) && d > 0 && t > d) t = d;
+      seekPending = true; seekFrom = -1;
+      hideLoadSpinner();
+      try { player.currentTime = t; } catch (e) {}
+      if (player.paused) { try { player.play(); } catch (e) {} }
+      setPpIcon('pause');
+      remoteLog('jump', { sec: sec, target: t, paused: player.paused });
+      showOsd();
+    }
+    // ---- YouTube-TV style extras -----------------------------------------
+    function rateLabel(r) { return r === 1 ? 'Normal' : (Math.round(r * 100) / 100) + 'x'; }
+    function setPlaybackRate(r) {
+      playbackRate = clampRate(r);
+      U.set('playbackRate', playbackRate);
+      try { if (player) player.playbackRate = playbackRate; } catch (e) {}
+      toast('Speed ' + rateLabel(playbackRate));
+    }
+    function openSpeedMenu() {
+      var rates = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 2], rows = [];
+      for (var i = 0; i < rates.length; i++) {
+        (function (r) {
+          rows.push({ label: (r === playbackRate ? '✓ ' : '') + rateLabel(r),
+            fn: function () { setPlaybackRate(r); } });
+        })(rates[i]);
+      }
+      playerMenu('Playback speed', rows);
+    }
+    function toggleMute() {
+      if (!player) return;
+      currentMuted = !currentMuted;
+      try { player.muted = currentMuted; } catch (e) {}
+      toast(currentMuted ? 'Muted' : 'Unmuted');
+      showOsd();
+    }
+    function adjustVolume(d) {
+      if (!player) return;
+      if (currentMuted) { currentMuted = false; try { player.muted = false; } catch (e) {} }
+      var v = typeof player.volume === 'number' ? player.volume : currentVolume;
+      v = Math.max(0, Math.min(1, Math.round((v + d) * 100) / 100));
+      currentVolume = v;
+      try { player.volume = v; } catch (e) {}
+      toast('Volume ' + Math.round(v * 100) + '%');
+      showOsd();
+    }
+    function toggleAutoplayNext() {
+      var v = !U.get('autoplayNext', false);
+      U.set('autoplayNext', v);
+      toast('Autoplay next: ' + (v ? 'On' : 'Off'));
+      openPlayerSettings();
+    }
+    function toggleLoop() {
+      var v = !U.get('loopVideo', false);
+      U.set('loopVideo', v);
+      toast('Loop video: ' + (v ? 'On' : 'Off'));
+      openPlayerSettings();
+    }
+    function openPlayerSettings() {
+      var rows = [
+        { label: 'Playback speed: ' + rateLabel(playbackRate), fn: openSpeedMenu },
+        { label: 'Subtitles and sync', fn: function () { U.qs('#subtitles', layer).onclick(); } },
+        { label: 'Audio track', fn: function () { U.qs('#audio', layer).onclick(); } },
+        { label: 'Autoplay next: ' + (U.get('autoplayNext', false) ? 'On' : 'Off'), fn: toggleAutoplayNext },
+        { label: 'Loop video: ' + (U.get('loopVideo', false) ? 'On' : 'Off'), fn: toggleLoop },
+        { label: 'Quality: ' + (opts.quality || 'Source'), fn: function () {
+            toast('Source quality: ' + (opts.quality || 'Auto') +
+              (opts.seeders !== undefined && opts.seeders !== null ? '  •  ' + opts.seeders + ' seeders' : ''));
+          } }
+      ];
+      playerMenu('Player settings', rows);
+    }
+    function stepEpisode(dir) {
+      var id = dir > 0 ? opts.nextId : opts.prevId;
+      var b = U.qs(dir > 0 ? '#next-ep-btn' : '#prev-ep', layer);
+      if (id && b && b.onclick && b.style.display !== 'none') b.onclick();
+      else toast(dir > 0 ? 'No next episode' : 'No previous episode');
+    }
+    function toggleInfo() {
+      var osd = U.qs('#osd', layer);
+      if (!osd) return;
+      if (osd.style.opacity === '0') showOsd();
+      else { osd.style.opacity = '0'; if (osdTimer) clearTimeout(osdTimer); }
+    }
+    playerToggle = togglePlayback;
+    playerJump = jumpBy;
+    playerStop = function () { closeLayers(); };
+    playerInfo = toggleInfo;
+    playerMute = toggleMute;
+    playerVolume = adjustVolume;
+    playerStep = stepEpisode;
     if (loader) U.qs('#osd', layer).style.opacity = '0';   // no controls during first load
     var tlMask = loader ? U.qs('#tl-logo-mask', layer) : null;
     // Wait for a small head buffer before starting. The logo fills linearly
     // with these bytes, so every MB downloaded visibly advances it.
     var START_BYTES = 16 * 1048576;
     var tlPct = 0, firstPlay = true, videoStarted = !opts.infoHash;
-    if (loader) load.className = 'loading'; else load.className = 'loading show';
+    // Direct streams: small spinner only until the first frame. Torrents: the
+    // logo loader is the only loading UI, so the spinner stays hidden.
+    if (loader) hideLoadSpinner(); else load.className = 'loading show';
 
     function setLoaderPct(pct) {
       if (!loader) return;
@@ -908,13 +1033,46 @@ var App = (function () {
         remoteLog('nolink', { engine: ei, diag: dg ? dg.innerHTML : '' });
       }, 5000);
     }
+    // Idle-freeze watchdog: after the OSD hides, some streams stop advancing
+    // currentTime without raising an error. Nudge the same URL instead of
+    // leaving a frozen picture until the user touches the remote.
+    var lastProgressAt = Date.now(), lastProgressTime = 0;
+    var stallKicks = 0, stallRecoveries = 0;
+    function watchdog() {
+      if (!player || layer.className.indexOf('hidden') !== -1) return;
+      if (!videoStarted || firstPlay || !playing || player.paused || scrubbing || seekPending) {
+        lastProgressAt = Date.now(); lastProgressTime = player ? (player.currentTime || 0) : 0;
+        return;
+      }
+      if (loader && loader.className.indexOf('hidden') === -1) return;
+      var t = player.currentTime || 0;
+      if (t > lastProgressTime + 0.2) {
+        lastProgressTime = t; lastProgressAt = Date.now(); stallKicks = 0;
+        return;
+      }
+      if (Date.now() - lastProgressAt < 8000) return;
+      stallKicks++;
+      remoteLog('stall-kick', { t: t, kick: stallKicks, recoveries: stallRecoveries, av: !!usingAvPlay });
+      if (stallKicks >= 3 && stallRecoveries < 3) {
+        // Repeated stalls: reload the same on-TV stream at the last position.
+        stallRecoveries++; stallKicks = 0;
+        opts.resumePos = t; resumeDone = false;
+        try { player.src = url; player.load(); player.play(); } catch (e) {}
+      } else if (stallKicks <= 2) {
+        // First two stalls: a small backward seek re-kicks the decoder/pipeline.
+        try { player.currentTime = Math.max(0, t - 2); player.play(); } catch (e) {}
+      }
+      lastProgressTime = Math.max(0, t - 2); lastProgressAt = Date.now();
+    }
+    if (!stallTimer) stallTimer = setInterval(watchdog, 2000);
+
     // Poll fast (4x/second) so the logo creeps forward as each chunk arrives.
     if (loader) { pollStats(); statsTimer = setInterval(pollStats, 250); }
     player.addEventListener('progress', function () {
       if (!statsTimer) setLoaderPct(bufferedPct());   // fallback when bridge is down
     });
     player.addEventListener('playing', function () {
-      if (!seekPending) load.className = 'loading';   // after a seek: wait for real progress
+      hideLoadSpinner();   // spinner is first-load only, never over the picture
       if (loader) {
         firstPlay = false;
         // Keep polling: the top-OSD download speed stays live during playback.
@@ -925,11 +1083,9 @@ var App = (function () {
       playing = true; resetOsd();
     });
     player.addEventListener('waiting', function () {
-      if (loader) {
-        if (firstPlay) return;                       // first-load logo stays up
-        loader.className = 'torrent-loader hidden';
-        load.className = 'loading show';             // simple spinner over the movie
-      } else load.className = 'loading show';
+      // Never bring the circular spinner back once the picture is up. The
+      // first-load logo/direct spinner already covered the initial wait.
+      hideLoadSpinner();
     });
     // Skipping forward jumps to a position the player has not fetched yet.
     // Show the spinner and keep it up until data at the new spot is ready.
@@ -937,14 +1093,14 @@ var App = (function () {
     function hideSeekLoad() {
       if (!seekPending) return;
       seekPending = false;
-      load.className = 'loading';
+      hideLoadSpinner();
     }
     player.addEventListener('seeking', function () {
       if (firstPlay) return;
       seekPending = true; seekFrom = -1;
-      load.className = 'loading show';
-      // Keep the round loader up until the new spot actually plays (the torrent
-      // may need to fetch it); only a long safety net hides it.
+      hideLoadSpinner();
+      // Keep the pending-seek guard until the new spot actually advances; no
+      // visual spinner is painted over the movie while that happens.
       setTimeout(hideSeekLoad, 45000);
     });
     player.addEventListener('seeked', function () {
@@ -1071,26 +1227,83 @@ var App = (function () {
       // end of the video. Show the loader and reload at that position.
       if (player && d && isFinite(d) && t < d - 30 && endRecoveries < 3) {
         endRecoveries++; recoverAt = t;
-        load.className = 'loading show';
+        hideLoadSpinner();
         remoteLog('premature-end', { t: t, d: d, attempt: endRecoveries });
         opts.resumePos = t; resumeDone = false;
         var wasPaused = player.paused;
         try { player.src = url; player.load(); if (!wasPaused) player.play(); } catch (e) {}
         return;
       }
+      if (U.get('loopVideo', false) && player) {
+        try { player.currentTime = 0; player.play(); } catch (e) {}
+        return;
+      }
+      if (U.get('autoplayNext', false) && opts.nextId) {
+        var nb = U.qs('#next-ep-btn', layer);
+        if (nb && nb.onclick && nb.style.display !== 'none') {
+          toast('Playing next episode');
+          nb.onclick();
+          return;
+        }
+      }
       toast('Playback finished'); closeLayers();
     });
 
-    U.qs('#pp', layer).onclick = function () {
-      if (player.paused) { player.play(); setPpIcon('pause'); } else { player.pause(); setPpIcon('play'); }
-    };
+    U.qs('#pp', layer).onclick = togglePlayback;
     function setPpIcon(n) {
       var b = U.qs('#pp', layer);
       if (b) { b.setAttribute('data-icon', n); refreshTabIcons(); }
     }
     U.qs('#back10', layer).onclick = function () { player.currentTime = Math.max(0, player.currentTime - 10); };
     U.qs('#fwd10', layer).onclick = function () { player.currentTime = Math.min(player.duration || 0, player.currentTime + 10); };
-    U.qs('#subtitles', layer).onclick = function () {
+    function reloadCaptionTracks(lang) {
+      if (!opts.mediaId) return;
+      API.getSubtitles(opts.mediaType || 'movie', opts.mediaId, lang, function (tracks) {
+        if (layer.className.indexOf('hidden') !== -1) return;
+        subTracks = (tracks || []).concat(opts.subtitles || []);
+        if (tracks && tracks.length && tracks[0].url) loadSubtitles(tracks[0].url);
+        else if (subTracks.length && subTracks[0].url) loadSubtitles(subTracks[0].url);
+      });
+    }
+    function openCaptionLangMenu() {
+      var langs = API.SUB_LANGS || [], cur = opts.subLang || U.get('subLang', 'en'), rows = [];
+      for (var i = 0; i < langs.length; i++) {
+        (function (L) {
+          rows.push({ label: L.name + ' (' + L.code + ')' + (L.code === cur ? '  ✓' : ''), fn: function () {
+            U.set('subLang', L.code); opts.subLang = L.code;
+            reloadCaptionTracks(L.code);
+            toast('Caption language: ' + L.name);
+            openSubtitleMenu();
+          } });
+        })(langs[i]);
+      }
+      playerMenu('Caption language', rows);
+    }
+    function openCaptionSizeMenu() {
+      var sizes = ['75%', '100%', '125%', '150%'], cur = U.get('subSize', '100%'), rows = [];
+      for (var i = 0; i < sizes.length; i++) {
+        (function (s) {
+          rows.push({ label: s + (s === cur ? '  ✓' : ''), fn: function () {
+            U.set('subSize', s); applySubtitleSettings(); openSubtitleMenu();
+          } });
+        })(sizes[i]);
+      }
+      playerMenu('Caption size', rows);
+    }
+    function openCaptionColorMenu() {
+      var cur = String(currentColor()).toLowerCase(), rows = [];
+      for (var i = 0; i < SUB_COLORS.length; i++) {
+        (function (c) {
+          rows.push({ label: c.name + (String(c.value).toLowerCase() === cur ? '  ✓' : ''), color: c.value,
+            fn: function () {
+              U.set('subColor', c.value); applySubtitleSettings();
+              toast('Caption text: ' + c.name); openSubtitleMenu();
+            } });
+        })(SUB_COLORS[i]);
+      }
+      playerMenu('Caption text', rows);
+    }
+    function openSubtitleMenu() {
       var langName = API.subLangName(opts.subLang || U.get('subLang', 'en'));
       var rows = [{
         label: subOn ? 'Turn subtitles off' : 'Turn subtitles on',
@@ -1105,7 +1318,10 @@ var App = (function () {
       { label: 'Drift: ' + driftStatus(), fn: function () { clearDrift(); } },
       { label: 'Reset subtitle sync', fn: function () {
           clearDrift(); setSubOffset(0, true); toast('Subtitle sync reset');
-        } }];
+        } },
+      { label: 'Caption language: ' + langName + '  ›', fn: openCaptionLangMenu },
+      { label: 'Caption size: ' + U.get('subSize', '100%') + '  ›', fn: openCaptionSizeMenu },
+      { label: 'Caption text: ' + colorName() + '  ›', fn: openCaptionColorMenu }];
       for (var i = 0; i < subTracks.length; i++) {
         (function (tr, idx) {
           var label = (tr.langName || tr.lang || 'Track') + '  •  ' + (tr.label || tr.name || ('Track ' + (idx + 1)));
@@ -1118,17 +1334,13 @@ var App = (function () {
           if (u && u.indexOf('http') === 0) loadSubtitles(u); else toast('Invalid URL');
         });
       } });
-      rows.push({ label: 'Color: ' + colorName() + '  (change in Settings)', color: currentColor(),
-        fn: function () {
-          stopPlayer();
-          layer.className = 'layer hidden';
-          U.set('settingsTab', 'Subtitles');
-          navigate('settings');
-        } });
-      playerMenu('Subtitles · ' + API.subLangName(opts.subLang || U.get('subLang', 'en')), rows);
-    };
+      playerMenu('Subtitles · ' + langName, rows);
+    }
+    U.qs('#subtitles', layer).onclick = openSubtitleMenu;
     U.qs('#audio', layer).onclick = function () { playerMenu('Audio', [{ label: 'Default', fn: function () {} }]); };
-    U.qs('#quality', layer).onclick = function () { playerMenu('Quality', [{ label: 'Auto', fn: function () {} }, { label: 'Best', fn: function () {} }]); };
+    U.qs('#mute', layer).onclick = toggleMute;
+    U.qs('#speed', layer).onclick = openSpeedMenu;
+    U.qs('#quality', layer).onclick = openPlayerSettings;
     function gotoEpisode(id, dir) {
       if (!id) return;
       remoteLog('episodenav', { dir: dir, id: id });
@@ -1173,7 +1385,8 @@ var App = (function () {
     nextEpisodeHooks = { preload: preloadNext };
     function playNextNow() {
       if (!opts.nextId) return;
-      load.className = 'loading show';
+      // playStream() rebuilds the layer with its own first-load loader.
+      hideLoadSpinner();
       resolveNext(function (s) {
         if (!s) { gotoEpisode(opts.nextId, 'next'); return; }    // no source: show the list
         var meta = playerData || {}, v = null, vs = meta.videos || [];
@@ -1199,12 +1412,13 @@ var App = (function () {
     };
     seekEl.onfocusin = function () {};
     // Player key map:
+    //   LEFT/RIGHT with controls hidden -> jump -10/+10 s and resume
     //   LEFT/RIGHT on a button -> walk the button row
     //   LEFT/RIGHT on the seek bar -> scrub; the longer you hold, the faster
     //   UP/DOWN -> cycle through all controls (incl. seek bar)
     //   OK      -> activate the focused control
-    var ctrlOrder = ['seek', 'pp', 'prev-ep', 'back10', 'fwd10', 'subtitles', 'audio', 'quality', 'next-ep-btn', 'next-ep'];
-    var btnOrder = ['pp', 'prev-ep', 'back10', 'fwd10', 'subtitles', 'audio', 'quality', 'next-ep-btn'];
+    var btnOrder = ['pp', 'prev-ep', 'back10', 'fwd10', 'subtitles', 'audio', 'mute', 'speed', 'quality', 'next-ep-btn'];
+    var ctrlOrder = ['seek'].concat(btnOrder).concat(['next-ep']);
     function moveHorizontal(dir) {
       var f = Focus.get(), idx = -1, i;
       for (i = 0; i < btnOrder.length; i++) if (f && f.id === btnOrder[i]) idx = i;
@@ -1238,10 +1452,14 @@ var App = (function () {
       if (!scrubTimer) scrubTimer = setInterval(scrubTick, 110);
       scrubTick();
     }
-    Focus.onKey(function (k) {
+    Focus.onKey(function (k, ev) {
       if (layer.className.indexOf('hidden') !== -1) return false;
       var pm = U.qs('#pmenu');
-      if (pm && pm.className.indexOf('open') !== -1) return false;   // menu owns navigation
+      if (pm && pm.className.indexOf('open') !== -1) {
+        // Back closes only the menu; the player stays open.
+        if (isBackKey(k)) { closePlayerMenu(); return true; }
+        return false;   // menu owns navigation
+      }
       var osd = U.qs('#osd');
       var nbx = U.qs('#next-ep', layer);
       var nextFocused = nbx && nbx.className.indexOf(' show') !== -1 && Focus.get() === nbx;
@@ -1249,7 +1467,15 @@ var App = (function () {
         // OK on the focused "Next Episode" button plays it right away.
         if (k === 13 && nextFocused) return false;
         // OK with the controls hidden: play/pause and show the controls.
-        if (k === 13) { var ppb = U.qs('#pp', layer); if (ppb && ppb.onclick) ppb.onclick(); showOsd(); return true; }
+        if (k === 13) { togglePlayback(); return true; }
+        // Left/Right with no controller visible: jump immediately instead of
+        // only moving the hidden scrub cursor. Ignore key repeat so holding the
+        // key does not also start a full scrub on the next event.
+        if (k === 37 || k === 39) {
+          if (!ev || !ev.repeat) jumpBy(k === 39 ? 10 : -10);
+          showOsd();
+          return true;
+        }
         showOsd();                                    // controls appear with the seek bar focused
         if (k === 38 || k === 40) return true;        // first Up/Down only reveals them
       }
@@ -1271,7 +1497,7 @@ var App = (function () {
         showOsd();
         return true;
       }
-      if (k === 13 || k === 10009) showOsd();   // OK: let the click happen
+      if (k === 13) showOsd();   // OK: let the click happen (10009 is Back)
       return false;
     });
     // Release: play straight from the cursor position (no delayed commit).
@@ -1288,12 +1514,38 @@ var App = (function () {
     try { player.play(); } catch (e) {}
   }
 
+  function isBackKey(k) { return k === 10009 || k === 461 || k === 8 || k === 27; }
+  function closePlayerMenu() {
+    var pm = U.qs('#pmenu');
+    if (!pm || pm.className.indexOf('open') === -1) return false;
+    pm.className = 'player-menu';
+    var back = playerMenuReturnFocus;
+    playerMenuReturnFocus = null;
+    if (back && back.parentNode) Focus.set(back);
+    else Focus.set(U.qs('#pp'));
+    return true;
+  }
   function playerMenu(title, rows) {
-    var pm = U.qs('#pmenu'); pm.innerHTML = '<div class="pm-title">' + U.esc(title) + '</div>';
+    var pm = U.qs('#pmenu');
+    // Remember the control that opened the first menu so Back returns there,
+    // not to a now-hidden menu row when a submenu replaces it.
+    if (pm && pm.className.indexOf('open') === -1) {
+      var f = Focus.get();
+      if (f && f.parentNode !== pm && String(f.className || '').indexOf('pm-row') === -1)
+        playerMenuReturnFocus = f;
+    }
+    pm.innerHTML = '<div class="pm-title">' + U.esc(title) + '</div>';
     for (var i = 0; i < rows.length; i++) {
       (function (r) {
         var e = U.el('div', 'pm-row', U.esc(r.label)); e.setAttribute('data-focus', '1');
-        e.onclick = function () { pm.className = 'player-menu'; if (r.fn) r.fn(); Focus.set(U.qs('#pp')); };
+        e.onclick = function () {
+          pm.className = 'player-menu';
+          if (r.fn) r.fn();
+          // If r.fn opened a submenu, playerMenu() already set focus on its
+          // first row; only refocus the player when the menu really closed.
+          var now = U.qs('#pmenu');
+          if (!now || now.className.indexOf('open') === -1) Focus.set(U.qs('#pp'));
+        };
         pm.appendChild(e);
       })(rows[i]);
     }
@@ -1323,7 +1575,11 @@ var App = (function () {
     if (saveProgressNow) { try { saveProgressNow(); } catch (e) {} saveProgressNow = null; }
     if (clearSeekTimer) { clearSeekTimer(); clearSeekTimer = null; }
     if (seekKeyupHandler) { document.removeEventListener('keyup', seekKeyupHandler, false); seekKeyupHandler = null; }
+    playerToggle = null; playerJump = null; playerStop = null; playerInfo = null;
+    playerMute = null; playerVolume = null; playerStep = null;
+    playerMenuReturnFocus = null;
     stopStatsPolling();
+    stopStallWatch();
     // Going straight to the next episode keeps the engine (peers, metadata and
     // the pre-loaded pieces); playStream() then switches its file.
     if (window.Engine && !keepEngine) window.Engine.stop();
@@ -1345,9 +1601,27 @@ var App = (function () {
     Focus.onBack(function () { back(); });
     Focus.onChange(function () { refreshTabIcons(); });
     Focus.setRoot(U.qs('#app'));
+    // Capture before Focus.js so all TV remote media keys are handled once.
+    // Volume/FF/REW may repeat; one-shot keys ignore auto-repeat.
     document.addEventListener('keydown', function (e) {
-      if (e.keyCode === 415 || e.keyCode === 19) { if (player) { U.qs('#pp').click(); e.preventDefault(); } }
-    });
+      if (!player) return;
+      var k = e.keyCode, handled = false;
+      if (k === 415 || k === 19 || k === 179) {
+        if (!e.repeat && playerToggle) playerToggle();
+        handled = !!playerToggle;
+      } else if (k === 412 && playerJump) { playerJump(-30); handled = true; }
+      else if (k === 417 && playerJump) { playerJump(30); handled = true; }
+      else if (k === 413 && playerStop) { if (!e.repeat) playerStop(); handled = true; }
+      else if (k === 457 && playerInfo) { if (!e.repeat) playerInfo(); handled = true; }
+      else if (k === 449 && playerMute) { if (!e.repeat) playerMute(); handled = true; }
+      else if (k === 447 && playerVolume) { playerVolume(0.1); handled = true; }
+      else if (k === 448 && playerVolume) { playerVolume(-0.1); handled = true; }
+      else if ((k === 427 || k === 428) && playerStep) {
+        if (!e.repeat) playerStep(k === 427 ? 1 : -1);
+        handled = true;
+      }
+      if (handled) { e.preventDefault(); e.stopPropagation(); }
+    }, true);
     setTimeout(function () {
       U.qs('#splash').style.display = 'none';
       U.qs('#app').style.display = 'block';

@@ -16,7 +16,7 @@ img{border:0}
 
 /* ---------- splash ---------- */
 #splash{position:fixed;left:0;top:0;width:1920px;height:1080px;background:#0C0B11;z-index:200;display:block}
-.splash-logo{position:absolute;left:50%;top:50%;width:180px;height:180px;margin:-90px 0 0 -90px;
+.splash-logo{position:absolute;left:50%;top:50%;width:216px;height:216px;margin:-108px 0 0 -108px;
   background:url('../assets/icons/stremio_logo_dark.png') no-repeat center/contain;animation:pulse 1.4s ease-in-out infinite}
 @keyframes pulse{0%,100%{opacity:.55;transform:scale(.96)}50%{opacity:1;transform:scale(1)}}
 
@@ -337,12 +337,14 @@ body.page-loading .tab.focused .bar{background:#7B5BF5}
 #player-layer{background:#000;z-index:120}
 #avplay{position:absolute;left:0;top:0;width:1920px;height:1080px;background:#000}
 .player-osd{position:absolute;left:0;top:0;width:1920px;height:1080px;z-index:3;pointer-events:none}
-.osd-top{position:absolute;left:0;top:0;width:1920px;height:190px;padding:40px 60px;background:linear-gradient(to bottom,rgba(0,0,0,.75),transparent)}
+/* YouTube-style bottom fade: 20% translucent (80% black) at the very bottom,
+   fully transparent just above the seek bar, so the controls stay readable. */
+.player-osd::before{content:"";position:absolute;left:0;bottom:0;width:1920px;height:380px;z-index:0;pointer-events:none;
+  background:linear-gradient(to top,rgba(0,0,0,.8) 0%,rgba(0,0,0,.55) 22%,rgba(0,0,0,.2) 38%,rgba(0,0,0,0) 50%)}
+.osd-top{position:absolute;left:0;top:0;width:1920px;height:190px;padding:40px 60px;z-index:1;background:linear-gradient(to bottom,rgba(0,0,0,.75),transparent)}
 .osd-title{font-size:46px;font-weight:700}
 .osd-sub{font-size:25px;color:rgba(255,255,255,.7);margin-top:8px}
-.osd-bottom{position:absolute;left:0;bottom:0;width:1920px;height:230px;padding:0 60px 34px;
-  /* 20 % black at the very bottom, fully transparent at the seek bar */
-  background:linear-gradient(to top,rgba(0,0,0,.2) 0%,rgba(0,0,0,0) 100%)}
+.osd-bottom{position:absolute;left:0;bottom:0;width:1920px;height:230px;padding:0 60px 34px;z-index:1;background:none}
 .seekbar{position:relative;height:10px;border-radius:5px;background:rgba(255,255,255,.25);margin-bottom:26px}
 .seekbar .fill{position:absolute;left:0;top:0;height:10px;border-radius:5px;background:#7B5BF5;width:0}
 .seekbar .knob{position:absolute;top:-9px;width:28px;height:28px;border-radius:50%;background:#7B5BF5;left:0;margin-left:-14px;display:none}

@@ -408,6 +408,24 @@ var API = (function () {
     return t + ' ' + word;
   }
 
+  // Stored addon lists can contain the same shelf twice: e.g. a manifest
+  // "New movies" catalog and the built-in "New Movies 2025" both resolve to
+  // Cinemeta's current-year URL. Keep one row per effective URL and one per
+  // visible title so Discover never shows duplicate categories.
+  function uniqueCatalogJobs(jobs) {
+    var seenUrl = {}, seenTitle = {}, out = [], i, j, u, t;
+    for (i = 0; i < jobs.length; i++) {
+      j = jobs[i];
+      u = String(j.url || '').toLowerCase();
+      t = String(j.title || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').replace(/^\s+|\s+$/g, '');
+      if (!u || seenUrl[u] || (t && seenTitle[t])) continue;
+      seenUrl[u] = 1;
+      if (t) seenTitle[t] = 1;
+      out.push(j);
+    }
+    return out;
+  }
+
   function catalogRows(type, cb, onRow) {
     var ck = type || 'all';
     if (catalogCache[ck]) {
@@ -546,15 +564,23 @@ var API = (function () {
           if (cs[j].type === 'search') continue;
           var dj = discoverJob(cs[j], genre, adds[i].base);
           if (!dj) continue;
+          // Title is computed here too, so dedupe can drop a second shelf that
+          // would look identical to the user even if its URL differs slightly.
+          var ttl = rowTitle(cs[j]);
+          if (/^year\/genre=\d{4}$/.test(String(cs[j].id)) && dj.path.indexOf(String(cs[j].id)) < 0)
+            ttl = ttl.replace(/\b(19|20)\d\d\b/, String(new Date().getFullYear()));
           // The sort's lead catalog must be first, so put it at the head of
           // the queue before any rows are drawn progressively.
           var lead = String(cs[j].id).split('/')[0] === SORT_CATALOG[sort] ? 0 : 1000;
           jobs.push({ cat: cs[j], url: adds[i].base + '/catalog/' + cs[j].type + '/' + dj.path + '.json',
-            serverGenre: dj.serverGenre, order: lead + jobs.length });
+            title: ttl, serverGenre: dj.serverGenre, order: lead + jobs.length });
         }
       }
       if (!jobs.length) { cb([]); return; }
       jobs.sort(function (a, b) { return a.order - b.order; });
+      // Prefer the lead shelf when two catalogs collapse to the same row.
+      jobs = uniqueCatalogJobs(jobs);
+      if (!jobs.length) { cb([]); return; }
       function buildOne(job) {
         var raw = discoverRaw[job.url];
         if (!raw || !raw.length) {
@@ -576,8 +602,7 @@ var API = (function () {
         var list = [];
         for (var x = 0; x < items.length; x++) list.push(items[x].m);
         if (!list.length) return null;
-        var ttl = rowTitle(job.cat);
-        if (/^year\/genre=\d{4}$/.test(String(job.cat.id)) && job.url.indexOf(job.cat.id) < 0) ttl = ttl.replace(/\b(19|20)\d\d\b/, String(new Date().getFullYear()));
+        var ttl = job.title || rowTitle(job.cat);
         return { title: ttl, items: list, type: job.cat.type, id: job.cat.id,
           order: job.order, _order: job.order };
       }
