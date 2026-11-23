@@ -1,0 +1,11 @@
+{
+  "files": {},
+  "program": {
+    "arm": {
+      "url": "stremio_engine_arm.nexe"
+    },
+    "x86-32": {
+      "url": "stremio_engine_x86_32.nexe"
+    }
+  }
+}

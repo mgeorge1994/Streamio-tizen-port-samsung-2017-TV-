@@ -1,0 +1,11 @@
+.DS_Store
+node_modules/
+*.log
+signed/
+*.wgt
+author-signature.xml
+signature1.xml
+.sign/
+nacl-toolchain/
+app-native/nacl/pnacl/
+__pycache__/

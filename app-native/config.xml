@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<widget xmlns="http://www.w3.org/ns/widgets"
+        xmlns:tizen="http://tizen.org/ns/widgets"
+        id="http://stremio.tizen.native/app"
+        version="1.0.76"
+        viewmodes="maximized">
+  <tizen:application id="stremiotv2.stremio" package="stremiotv2" required_version="3.0"/>
+  <content src="index.html"/>
+  <name>Stremio Native</name>
+  <author>Stremio Tizen Port</author>
+  <description>Stremio with an on-device NaCl torrent engine (red tile)</description>
+  <icon src="icon.png"/>
+  <access origin="*" subdomains="true"/>
+  <tizen:privilege name="http://tizen.org/privilege/internet"/>
+  <tizen:privilege name="http://tizen.org/privilege/application.launch"/>
+  <tizen:privilege name="http://tizen.org/privilege/unlimitedstorage"/>
+  <tizen:setting screen-orientation="landscape" context-menu="ignore" background-support="disable" encryption="disable" install-location="auto" hwkey-event="enable"/>
+</widget>
