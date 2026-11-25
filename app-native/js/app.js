@@ -120,6 +120,7 @@ var App = (function () {
     markTab(name);
     Focus.clear();
     Focus.setRoot(U.qs('#app'));
+    if (Views.dispose) Views.dispose();
     if (name === 'board') Views.board(view);
     else if (name === 'discover') Views.discover(view, false);
     else if (name === 'library') Views.library(view);
@@ -200,8 +201,8 @@ var App = (function () {
       else { var f = Focus.candidates()[0]; if (f) Focus.set(f); }
       return;
     }
-    if (kb.className.indexOf('hidden') === -1) { kb.className = 'layer hidden'; Focus.setRoot(U.qs('#app')); Focus.first(); return; }
-    if (modal.className.indexOf('hidden') === -1) { stopQrPolling(); modal.className = 'layer hidden'; Focus.setRoot(U.qs('#app')); Focus.first(); }
+    if (kb.className.indexOf('hidden') === -1) { kb.className = 'layer hidden'; Focus.setRoot(U.qs('#app')); Focus.first(); lastLayerClose = Date.now(); return; }
+    if (modal.className.indexOf('hidden') === -1) { stopQrPolling(); modal.className = 'layer hidden'; Focus.setRoot(U.qs('#app')); Focus.first(); lastLayerClose = Date.now(); }
   }
 
   function modal(title, rows) {
@@ -305,7 +306,7 @@ var App = (function () {
 
     API.createLinkCode(function (link) {
       var body = U.qs('#qr-body', m);
-      if (!body) return;
+      if (!body || layer.className.indexOf('hidden') !== -1) return;
       var qr = link.qrcode || ('https://link.stremio.com/qr?data=' + encodeURIComponent(link.link || ''));
       body.innerHTML = '<img class="qr-img" src="' + U.attr(qr) + '" />' +
         '<div class="qr-code">' + U.esc(link.code) + '</div>' +
@@ -314,6 +315,7 @@ var App = (function () {
       Focus.set(U.qs('.m-close', m));
       stopQrPolling();
       qrTimer = setInterval(function () {
+        if (layer.className.indexOf('hidden') !== -1) { stopQrPolling(); return; }
         API.readLinkCode(link.code, function (res) {
           var key = res.authKey || (res.auth && res.auth.key);
           if (!key) return;
@@ -331,7 +333,8 @@ var App = (function () {
       }, 2500);
     }, function (e) {
       var body = U.qs('#qr-body', m);
-      if (body) body.innerHTML = '<div class="empty">Could not start sign in: ' + U.esc(e) + '</div>';
+      if (body && layer.className.indexOf('hidden') === -1)
+        body.innerHTML = '<div class="empty">Could not start sign in: ' + U.esc(e) + '</div>';
     });
   }
 
@@ -401,6 +404,7 @@ var App = (function () {
   }
 
   /* ---------------- subtitles ---------------- */
+  var lastSubtitleCss = '', lastSubtitleHtml = '', lastTimeText = '';
   function currentColor() { return U.get('subColor', '#FFFFFF'); }
   function colorName() {
     var c = String(currentColor()).toLowerCase();
@@ -413,17 +417,24 @@ var App = (function () {
     var color = currentColor();
     var sizes = { '75%': 32, '100%': 46, '125%': 58, '150%': 70 };
     var px = (sizes[U.get('subSize', '100%')] || 46) + 'px';
-    // Inject a document-level rule as well as the inline style: the player
-    // rebuilds #subtitle on every play, so an inline-only change can be lost.
+    var css = '.subtitle{color:' + color + '!important;font-size:' + px + '!important}';
+    // The inline style must be re-applied to a freshly rebuilt #subtitle even
+    // when the document rule is unchanged.
+    var el = U.qs('#subtitle');
+    if (el && (el.style.color !== color || el.style.fontSize !== px)) {
+      el.style.color = color; el.style.fontSize = px;
+    }
+    // Rewriting a <style> every timeupdate forced a full style recalculation
+    // and eventually made the UI stop answering the remote. Write only on change.
+    if (css === lastSubtitleCss) return;
+    lastSubtitleCss = css;
     var st = document.getElementById('subtitle-style');
     if (!st) {
       st = document.createElement('style');
       st.id = 'subtitle-style';
       (document.head || document.documentElement).appendChild(st);
     }
-    st.innerHTML = '.subtitle{color:' + color + '!important;font-size:' + px + '!important}';
-    var el = U.qs('#subtitle');
-    if (el) { el.style.color = color; el.style.fontSize = px; }
+    st.innerHTML = css;
   }
   function parseTime(s) {
     var p = String(s).replace(',', '.').split(':');
@@ -454,71 +465,40 @@ var App = (function () {
     return (n > 0 ? '+' : '') + (Math.round(n * 10) / 10) + ' s';
   }
   function clampOffset(v) { return Math.max(-600, Math.min(600, Math.round((Number(v) || 0) * 10) / 10)); }
-  function saveDrift() {
-    if (!subSyncKey) return;
-    U.set('subSync:' + subSyncKey, subOffset);
-    U.set('subDrift:' + subSyncKey, { a: driftA, b: driftB });
-  }
-  // With both points set, the offset is interpolated between them. This fixes
-  // the common case where the start matches but the end slowly drifts apart
-  // (23.976 vs 24 fps). Outside the two points the nearest point's offset holds.
-  function effectiveOffset(t) {
-    if (!driftA || !driftB || driftB.t <= driftA.t) return subOffset;
-    var f = (t - driftA.t) / (driftB.t - driftA.t);
-    if (f < 0) f = 0; else if (f > 1) f = 1;
-    return driftA.o + (driftB.o - driftA.o) * f;
+  function saveSubOffset() {
+    if (subSyncKey) U.set('subSync:' + subSyncKey, subOffset);
   }
   function setSubOffset(v, save) {
     subOffset = clampOffset(v);
-    if (driftA && driftB) {
-      // Editing while two points exist changes the point nearest playback.
-      var t = player ? (player.currentTime || 0) : driftB.t;
-      if (Math.abs(t - driftB.t) <= Math.abs(t - driftA.t)) driftB.o = subOffset;
-      else driftA.o = subOffset;
-    } else if (driftA) driftA.o = subOffset;
-    else if (driftB) driftB.o = subOffset;
-    if (save) saveDrift();
+    if (save) saveSubOffset();
     updateSubtitle();
   }
   function adjustSubOffset(d) {
     setSubOffset(subOffset + d, true);
     toast('Subtitle sync: ' + subSyncLabel(subOffset));
   }
-  function markSyncPoint(which) {
-    if (!player) return;
-    var t = player.currentTime || 0, o = clampOffset(effectiveOffset(t));
-    if (which === 'a') driftA = { t: t, o: o }; else driftB = { t: t, o: o };
-    if (driftA && driftB && driftB.t <= driftA.t) {
-      var tmp = driftA; driftA = driftB; driftB = tmp;
+  // Start here: the current playback time is where the first subtitle words
+  // must be heard. Align the nearest cue start to that point.
+  function startSubtitleHere() {
+    if (!player || !subCues.length) { toast('No subtitle loaded'); return; }
+    var t = player.currentTime || 0, best = null, bestDist = Infinity, i, d;
+    for (i = 0; i < subCues.length; i++) {
+      d = Math.abs(subCues[i].start - t);
+      if (d < bestDist) { bestDist = d; best = subCues[i]; }
     }
-    subOffset = o;
-    saveDrift();
-    toast('Sync ' + (which === 'a' ? 'start' : 'end') + ' set at ' + U.fmtTime(t));
-  }
-  function clearDrift() {
-    driftA = null; driftB = null;
-    setSubOffset(subOffset, true);
-    toast('Drift correction cleared');
-  }
-  function driftStatus() {
-    if (!driftA || !driftB) return driftA ? 'Start point set' : 'Off';
-    return U.fmtTime(driftA.t) + ' ' + subSyncLabel(driftA.o) + ' \u2192 ' +
-           U.fmtTime(driftB.t) + ' ' + subSyncLabel(driftB.o);
+    if (!best) { toast('No subtitle cue'); return; }
+    setSubOffset(t - best.start, true);
+    toast('Subtitle start set at ' + U.fmtTime(t));
   }
   function loadSavedSubOffset(key) {
     subSyncKey = key || '';
     subAutoSync = U.get('subAutoSync', true) !== false;
     var v = subAutoSync && subSyncKey ? U.get('subSync:' + subSyncKey, 0) : 0;
     subOffset = clampOffset(v);
-    var d = subAutoSync && subSyncKey ? U.get('subDrift:' + subSyncKey, null) : null;
-    driftA = (d && d.a && typeof d.a.t === 'number') ? d.a : null;
-    driftB = (d && d.b && typeof d.b.t === 'number') ? d.b : null;
-    if (driftA) driftA.o = clampOffset(driftA.o);
-    if (driftB) driftB.o = clampOffset(driftB.o);
   }
   function loadSubtitles(url) {
     subUrl = url || '';
-    subCues = []; updateSubtitle();
+    subCues = []; lastSubtitleHtml = ''; updateSubtitle();
     API.getText(url, function (txt) {
       subCues = parseSubs(txt);
       updateSubtitle();
@@ -529,14 +509,14 @@ var App = (function () {
     if (!el) return;
     if (!subOn || !subCues.length || !player) { el.innerHTML = ''; return; }
     // A +2 s offset means the SRT is 2 s early: match it against t-2.
-    var now = player.currentTime || 0, t = now - effectiveOffset(now), found = null;
+    var now = player.currentTime || 0, t = now - subOffset, found = null;
     for (var i = 0; i < subCues.length; i++) {
       if (t >= subCues[i].start && t <= subCues[i].end) { found = subCues[i]; break; }
     }
-    el.innerHTML = found ? found.lines.join('<br/>') : '';
-    // Re-assert on every frame: the setting may be changed from Settings while
-    // the player is open, or a rebuild may have reset the inline colour.
-    applySubtitleSettings();
+    var html = found ? found.lines.join('<br/>') : '';
+    if (html !== lastSubtitleHtml) { lastSubtitleHtml = html; el.innerHTML = html; }
+    // applySubtitleSettings() is called when the setting changes and when the
+    // player is rebuilt. Never rewrite the document <style> on every frame.
   }
 
   /* ---------------- player ---------------- */
@@ -546,17 +526,41 @@ var App = (function () {
   // Hardware keys are routed through these hooks so they always act on the
   // current player, even while the on-screen controller is hidden.
   var playerToggle = null, playerJump = null, playerStop = null, playerInfo = null;
-  var playerMute = null, playerVolume = null, playerStep = null;
+  var playerMute = null, playerVolume = null, playerStep = null, playerOk = null;
   var playerMenuReturnFocus = null;
+  var playerMenuStack = [], playerMenuFocusStack = [];
+  var playerMenuTitle = '', playerMenuRows = null, playerMenuFocus = 0, playerMenuRenderId = 0;
   var playerReturnFocus = null, lastLayerClose = 0;
   var subCues = [], subTracks = [], subOn = true, subUrl = '';
   var subOffset = 0, subSyncKey = '', subAutoSync = true;   // subtitle sync, seconds added to cue times
-  var driftA = null, driftB = null;   // two-point drift correction: {t, o} pairs
   var saveProgressNow = null;   // set by playUrl; called on exit to store the final position
   var nextEpisodeHooks = null;  // set by playUrl: pre-load of the next episode
-  var qrTimer = null, statsTimer = null, stallTimer = null;
+  var cancelNextAutoplay = null; // set by playUrl; stops the Up-next countdown on exit
+  var qrTimer = null, statsTimer = null, stallTimer = null, statsSlow = false;
+  var focusReclaimTimer = null;
+  // Module-level so the global key handler can log errors even when the player
+  // closure is not in scope. playUrl() replaces this with its logger on start.
+  var remoteLog = function () {};
+  // All remote keys arrive on document. A native plugin (AVPlay object or the
+  // NaCl embed) can silently take native focus; the picture keeps moving but
+  // no key event ever reaches us. Pull focus back to a hidden HTML sink.
+  function reclaimRemoteFocus(force) {
+    var pl = U.qs('#player-layer');
+    if (!pl || pl.className.indexOf('hidden') !== -1) return;
+    var pm = U.qs('#pmenu', pl);
+    if (pm && pm.className.indexOf('open') !== -1) return;
+    var active = document.activeElement;
+    var stolen = !!active && (active.tagName === 'OBJECT' || active.tagName === 'EMBED' ||
+      active.id === 'stremio-engine' || active.id === 'video');
+    if (!force && !stolen) return;
+    var sink = U.qs('#remote-focus', pl);
+    if (sink && sink.focus) { try { sink.focus(); } catch (e) {} }
+    var pp = U.qs('#pp', pl);
+    if (pp) Focus.set(pp);
+    remoteLog('focus-reclaim', { tag: active ? active.tagName : '', id: active ? active.id : '' });
+  }
   function stopQrPolling() { if (qrTimer) { clearInterval(qrTimer); qrTimer = null; } }
-  function stopStatsPolling() { if (statsTimer) { clearInterval(statsTimer); statsTimer = null; } }
+  function stopStatsPolling() { if (statsTimer) { clearInterval(statsTimer); statsTimer = null; } statsSlow = false; }
   function stopStallWatch() { if (stallTimer) { clearInterval(stallTimer); stallTimer = null; } }
 
   var SUB_COLORS = [
@@ -597,6 +601,18 @@ var App = (function () {
     }
     return { prevId: '', nextId: '' };
   }
+  // Label + still for the "Up next" card. Uses the same episode list as the
+  // next-episode button, so no extra metadata request is needed.
+  function nextEpisodeInfo(meta, nextId) {
+    var vids = ((meta && meta.videos) || []).slice(0);
+    for (var i = 0; i < vids.length; i++) {
+      if (vids[i].id !== nextId) continue;
+      var n = vids[i], se = Number(n.season) || 0, ep = Number(n.episode) || 0;
+      return { title: 'S' + se + ' E' + ep + (n.title ? '  •  ' + n.title : ''),
+        thumb: n.thumbnail || n.poster || '' };
+    }
+    return { title: 'Next episode', thumb: '' };
+  }
 
   function playStream(s, meta, info) {
     currentStream = s; playerData = meta || {};
@@ -626,11 +642,14 @@ var App = (function () {
     info = info || {};
     var parsed = API.parseStream(s);
     var nav = episodeNeighbors(meta, info.videoId);
+    var nextId = info.nextId || nav.nextId;
+    var nxi = nextEpisodeInfo(meta, nextId);
     playUrl(url, info.title || parsed.title || s.name, {
       poster: meta && meta.poster, type: 'stream', subtitles: s.subtitles,
       quality: info.quality || parsed.quality, seeders: info.seeders,
       infoHash: hash, fileIdx: fidx,
-      prevId: info.prevId || nav.prevId, nextId: info.nextId || nav.nextId,
+      prevId: info.prevId || nav.prevId, nextId: nextId,
+      nextTitle: info.nextTitle || nxi.title, nextThumb: info.nextThumb || nxi.thumb,
       preferAv: prefersAvPlay(s),
       id: info.progressId, videoId: info.videoId, resumePos: info.resumePos,
       mediaType: info.mediaType, mediaId: info.videoId || (meta && meta.id),
@@ -686,6 +705,40 @@ var App = (function () {
 
   function playUrl(url, title, opts) {
     opts = opts || {};
+    // The "Up next" card, its countdown and the auto-play all use the same
+    // Settings value: N minutes before the end the card appears, counts down
+    // over that window, then plays the next episode unless the player is exited.
+    var nextCountdownSec = (Number(U.get('nextEpMin', 2)) || 2) * 60;
+    var preSec = (Number(U.get('prefetchMin', 5)) || 5) * 60;
+    var nextAutoCancelled = false, nextAutoFired = false;
+    var lastNextKicker = '', lastNextWidth = '';
+    function writeNextKicker(s, w) {
+      if (s !== lastNextKicker) {
+        var k = U.qs('#next-ep-kicker', layer);
+        lastNextKicker = s;
+        if (k) k.innerHTML = s;
+      }
+      if (w !== lastNextWidth) {
+        var p = U.qs('#next-ep-progress', layer);
+        lastNextWidth = w;
+        if (p) p.style.width = w;
+      }
+    }
+    function cancelNextAuto() {
+      nextAutoCancelled = true;
+      writeNextKicker('UP NEXT', '0%');
+    }
+    cancelNextAutoplay = cancelNextAuto;
+    function resetNextCountdown() {
+      writeNextKicker('UP NEXT IN ' + U.fmtTime(nextCountdownSec), '0%');
+    }
+    function updateNextCountdown(remain) {
+      if (!opts.nextId || nextAutoCancelled || nextAutoFired) return;
+      var left = Math.max(0, remain);
+      writeNextKicker('UP NEXT IN ' + U.fmtTime(Math.ceil(left)),
+        Math.max(0, Math.min(100, (nextCountdownSec - left) / nextCountdownSec * 100)) + '%');
+      if (left <= 0.5) { nextAutoFired = true; playNextNow(); }
+    }
     // Remember the menu control that launched playback so Back lands on it.
     playerReturnFocus = Focus.get();
     // Gray subtitle under the title: quality + seeders for torrent streams.
@@ -708,27 +761,39 @@ var App = (function () {
       '<div class="player-controls">' +
       '<span class="pbtn playpause" data-focus="1" data-icon="pause" id="pp"><i style="background-image:' + U.icon('pause') + '"></i></span>' +
       '<span class="pbtn" data-focus="1" data-icon="chevrons_back" id="prev-ep"><i style="background-image:' + U.icon('chevrons_back') + '"></i></span>' +
+      '<span class="pbtn" data-focus="1" data-icon="chevrons_forward" id="next-ep-btn"><i style="background-image:' + U.icon('chevrons_forward') + '"></i></span>' +
       '<span class="pbtn" data-focus="1" data-icon="chevron_back" id="back10"><i style="background-image:' + U.icon('chevron_back') + '"></i></span>' +
       '<span class="pbtn" data-focus="1" data-icon="chevron_forward" id="fwd10"><i style="background-image:' + U.icon('chevron_forward') + '"></i></span>' +
       '<span class="pbtn" data-focus="1" data-icon="subtitles" id="subtitles"><i style="background-image:' + U.icon('subtitles') + '"></i></span>' +
       '<span class="pbtn" data-focus="1" data-icon="audio_tracks" id="audio"><i style="background-image:' + U.icon('audio_tracks') + '"></i></span>' +
       '<span class="pbtn" data-focus="1" data-icon="audio" id="mute"><i style="background-image:' + U.icon('audio') + '"></i></span>' +
       '<span class="pbtn" data-focus="1" data-icon="speed" id="speed"><i style="background-image:' + U.icon('speed') + '"></i></span>' +
-      '<span class="pbtn" data-focus="1" data-icon="settings" id="quality"><i style="background-image:' + U.icon('settings') + '"></i></span>' +
-      '<span class="pbtn" data-focus="1" data-icon="chevrons_forward" id="next-ep-btn"><i style="background-image:' + U.icon('chevrons_forward') + '"></i></span>' +
       '<span class="time" id="time">0:00 / 0:00</span>' +
       '</div></div></div>' +
+      '<div id="remote-focus" tabindex="-1" style="position:absolute;left:-100px;top:-100px;width:1px;height:1px;outline:none"></div>' +
       '<div class="subtitle" id="subtitle"></div>' +
       '<div class="player-menu" id="pmenu"></div>' +
-      '<div class="next-episode" id="next-ep" data-focus="1">▶ Next Episode</div>';
+      '<div class="next-episode" id="next-ep">' +
+      '<div class="ne-card">' +
+      '<div class="ne-thumb" id="next-ep-thumb"></div>' +
+      '<div class="ne-info"><div class="ne-kicker" id="next-ep-kicker">UP NEXT</div>' +
+      '<div class="ne-title" id="next-ep-title">' + U.esc(opts.nextTitle || 'Next episode') + '</div>' +
+      '<div class="ne-progress" id="next-ep-progress"></div></div>' +
+      '<div class="ne-action" id="next-ep-action" data-focus="1">▶ Next Episode</div>' +
+      '</div></div>';
     Focus.setRoot(layer);
-    subCues = []; subOn = true; subUrl = '';
+    var nextThumb = U.qs('#next-ep-thumb', layer);
+    if (nextThumb && opts.nextThumb) nextThumb.style.backgroundImage = 'url("' + U.attr(opts.nextThumb) + '")';
+    subCues = []; subOn = true; subUrl = ''; lastSubtitleHtml = ''; lastTimeText = '';
     subTracks = opts.subtitles || [];
     loadSavedSubOffset(opts.videoId || opts.mediaId || (title ? 'title:' + title : ''));
     applySubtitleSettings();
     // Episode skip buttons are only meaningful for series episodes.
     if (!opts.prevId) { var pbtn = U.qs('#prev-ep', layer); if (pbtn) pbtn.style.display = 'none'; }
-    if (!opts.nextId) { var nbtn = U.qs('#next-ep-btn', layer); if (nbtn) nbtn.style.display = 'none'; }
+    if (!opts.nextId) {
+      var nbtn = U.qs('#next-ep-btn', layer); if (nbtn) nbtn.style.display = 'none';
+      var nep = U.qs('#next-ep', layer); if (nep) nep.style.display = 'none';
+    }
     // Subtitles come from the installed subtitle addons, in the language
     // selected in Settings. Stream-attached tracks remain as a fallback.
     if (opts.mediaId) {
@@ -775,6 +840,10 @@ var App = (function () {
       document.documentElement.className += ' avplay-active';
       document.body.className += ' avplay-active';
       av.src = url; av.load(); av.play();
+      // Keep the HTML controller in charge of the remote after the plugin is
+      // inserted; otherwise AVPlay can swallow arrow keys and look frozen.
+      reclaimRemoteFocus(true);
+      showOsd(true);
       remoteLog('avswitch', { step: 'loaded' });
       return true;
     }
@@ -783,7 +852,7 @@ var App = (function () {
     // the actual seek happens one second after the key is released. Repeated
     // keydowns used to fire a seek each time, which starved the torrent stream.
     var scrubbing = false, seekTarget = 0, scrubDir = 0, scrubHoldAt = 0, scrubTimer = null;
-    var wasPlayingBeforeScrub = false;
+    var wasPlayingBeforeScrub = false, lastScrubKeyAt = 0, seekHideTimer = null;
     function paintSeek(t) {
       var d = player && player.duration, known = d && isFinite(d) && d > 0;
       var pct = known ? Math.max(0, Math.min(100, t / d * 100)) : 0;
@@ -809,6 +878,7 @@ var App = (function () {
     }
     clearSeekTimer = function () {
       if (scrubTimer) { clearInterval(scrubTimer); scrubTimer = null; }
+      if (seekHideTimer) { clearTimeout(seekHideTimer); seekHideTimer = null; }
       scrubbing = false; scrubDir = 0;
       seekEl.className = seekEl.className.replace(/\s*scrubbing/g, '');
     };
@@ -824,8 +894,10 @@ var App = (function () {
     function togglePlayback() {
       if (!player || layer.className.indexOf('hidden') !== -1) return;
       if (scrubbing) commitSeek();
-      if (player.paused) { try { player.play(); } catch (e) {} setPpIcon('pause'); }
+      var wasPaused = !!player.paused;
+      if (wasPaused) { try { player.play(); } catch (e) {} setPpIcon('pause'); }
       else { try { player.pause(); } catch (e) {} setPpIcon('play'); }
+      remoteLog('toggle', { from: wasPaused ? 'paused' : 'playing', av: !!usingAvPlay });
       showOsd();
     }
     // Left/Right with the controller hidden: real -10/+10 s jump, not just a
@@ -856,8 +928,8 @@ var App = (function () {
       var rates = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 2], rows = [];
       for (var i = 0; i < rates.length; i++) {
         (function (r) {
-          rows.push({ label: (r === playbackRate ? '✓ ' : '') + rateLabel(r),
-            fn: function () { setPlaybackRate(r); } });
+          rows.push({ label: rateLabel(r), current: r === playbackRate,
+            fn: function () { setPlaybackRate(r); openSpeedMenu(true); } });
         })(rates[i]);
       }
       playerMenu('Playback speed', rows);
@@ -879,32 +951,6 @@ var App = (function () {
       toast('Volume ' + Math.round(v * 100) + '%');
       showOsd();
     }
-    function toggleAutoplayNext() {
-      var v = !U.get('autoplayNext', false);
-      U.set('autoplayNext', v);
-      toast('Autoplay next: ' + (v ? 'On' : 'Off'));
-      openPlayerSettings();
-    }
-    function toggleLoop() {
-      var v = !U.get('loopVideo', false);
-      U.set('loopVideo', v);
-      toast('Loop video: ' + (v ? 'On' : 'Off'));
-      openPlayerSettings();
-    }
-    function openPlayerSettings() {
-      var rows = [
-        { label: 'Playback speed: ' + rateLabel(playbackRate), fn: openSpeedMenu },
-        { label: 'Subtitles and sync', fn: function () { U.qs('#subtitles', layer).onclick(); } },
-        { label: 'Audio track', fn: function () { U.qs('#audio', layer).onclick(); } },
-        { label: 'Autoplay next: ' + (U.get('autoplayNext', false) ? 'On' : 'Off'), fn: toggleAutoplayNext },
-        { label: 'Loop video: ' + (U.get('loopVideo', false) ? 'On' : 'Off'), fn: toggleLoop },
-        { label: 'Quality: ' + (opts.quality || 'Source'), fn: function () {
-            toast('Source quality: ' + (opts.quality || 'Auto') +
-              (opts.seeders !== undefined && opts.seeders !== null ? '  •  ' + opts.seeders + ' seeders' : ''));
-          } }
-      ];
-      playerMenu('Player settings', rows);
-    }
     function stepEpisode(dir) {
       var id = dir > 0 ? opts.nextId : opts.prevId;
       var b = U.qs(dir > 0 ? '#next-ep-btn' : '#prev-ep', layer);
@@ -915,8 +961,29 @@ var App = (function () {
       var osd = U.qs('#osd', layer);
       if (!osd) return;
       if (osd.style.opacity === '0') showOsd();
-      else { osd.style.opacity = '0'; if (osdTimer) clearTimeout(osdTimer); }
+      else hideOsd();
     }
+    // OK/Enter with the controller hidden is handled in the capture phase so
+    // it always toggles playback instead of clicking a hidden control.
+    playerOk = function (k, ev) {
+      if (k !== 13 || (ev && ev.repeat)) return false;
+      var pm = U.qs('#pmenu', layer);
+      if (pm && pm.className.indexOf('open') !== -1) return false;
+      // While the Next Episode prompt is on screen, OK always plays it.
+      var nbx = U.qs('#next-ep', layer);
+      if (nbx && nbx.className.indexOf(' show') !== -1) {
+        if (nbx.onclick) nbx.onclick(); else nbx.click();
+        return true;
+      }
+      // Otherwise OK is Play/Pause when no specific control is being used:
+      // either the controller is hidden or only the seek bar has focus.
+      var osd = U.qs('#osd', layer);
+      if (!osd || osd.style.opacity === '0' || Focus.get() === seekEl) {
+        togglePlayback();
+        return true;
+      }
+      return false;   // a focused control button handles its own OK
+    };
     playerToggle = togglePlayback;
     playerJump = jumpBy;
     playerStop = function () { closeLayers(); };
@@ -950,35 +1017,49 @@ var App = (function () {
     }
     // TEMP: ship live engine diagnostics to the development PC so no one has
     // to read numbers off the TV screen.
-    var remoteLogAt = 0;
-    function remoteLog(kind, extra) {
+    var remoteLogAt = 0, lastStatsLogAt = 0;
+    function playLog(kind, extra, force) {
       try {
         var now = (Date.now ? Date.now() : (new Date()).getTime());
-        if (now - remoteLogAt < 900) return;
+        if (!force && now - remoteLogAt < 900) return;
         remoteLogAt = now;
         var payload = { kind: kind, ts: now, hash: opts.infoHash || '' };
         for (var k in extra) if (extra.hasOwnProperty(k)) payload[k] = extra[k];
         var x = new XMLHttpRequest();
         x.open('POST', 'http://192.168.0.136:8877/log', true);
         x.setRequestHeader('Content-Type', 'application/json');
-        x.send(JSON.stringify(payload));
+        // The dev PC may be offline. Never let failed log posts pile up: an
+        // async XHR with no timeout can hang forever and starve the UI thread.
+        x.timeout = 1200;
+        var release = function () {
+          x.onload = x.onerror = x.ontimeout = x.onabort = null;
+          x = null;
+        };
+        x.onload = release; x.onerror = release; x.ontimeout = release; x.onabort = release;
+        try { x.send(JSON.stringify(payload)); } catch (e) { release(); }
       } catch (e) {}
     }
+    remoteLog = playLog;
+    // Value-guarded DOM writes: the old TV's style/layout engine fell behind
+    // when hidden diagnostic nodes were rewritten several times a second.
+    function setHtml(el, s) { if (el && el.innerHTML !== s) el.innerHTML = s; }
+    var statsInFlight = false;
     function pollStats() {
-      if (!loader || layer.className.indexOf('hidden') !== -1) return;
+      if (statsInFlight || !loader || layer.className.indexOf('hidden') !== -1) return;
+      statsInFlight = true;
       API.request(API.streamServer() + '/stats/' + opts.infoHash, function (d) {
+        statsInFlight = false;
         if (!d || layer.className.indexOf('hidden') !== -1) return;
         lastStats = d;
         // Inside the round loader (seek / buffering): how much of the data
         // needed at the current spot has arrived.
-        var lpEl = U.qs('#load-pct', layer);
-        if (lpEl) lpEl.innerHTML = Math.max(0, Math.min(100, Math.round(Number(d.bufPct) || 0))) + '%';
-        var sp = U.qs('#tl-speed', layer), dn = U.qs('#tl-down', layer), pr = U.qs('#tl-peers', layer);
-        var osdSp = U.qs('#osd-speed', layer);
-        if (sp) sp.innerHTML = fmtRate(d.downloadSpeed);
-        if (osdSp) osdSp.innerHTML = fmtRate(d.downloadSpeed);   // top OSD, next to seeders
-        if (dn) dn.innerHTML = fmtBytes(d.downloaded);
-        if (pr) pr.innerHTML = String(d.peers || 0);
+        setHtml(U.qs('#load-pct', layer),
+          Math.max(0, Math.min(100, Math.round(Number(d.bufPct) || 0))) + '%');
+        var spd = fmtRate(d.downloadSpeed);
+        setHtml(U.qs('#tl-speed', layer), spd);
+        setHtml(U.qs('#osd-speed', layer), spd);   // top OSD, next to seeders
+        setHtml(U.qs('#tl-down', layer), fmtBytes(d.downloaded));
+        setHtml(U.qs('#tl-peers', layer), String(d.peers || 0));
         // Metadata just became ready: this is the first moment the engine's
         // HTTP server can actually serve byte ranges for this file. Setting
         // <video src> any earlier caused a storm of 404s that the player
@@ -1007,14 +1088,21 @@ var App = (function () {
         // TEMP DIAGNOSTIC — shows where on-device discovery is failing.
         var dg = U.qs('#tl-diag', layer);
         var ei = (window.Engine && window.Engine.getInfo) ? window.Engine.getInfo() : {};
-        if (dg) dg.innerHTML = 'st' + (d.stage || 0) + '/' + (d.attempts || 0) +
+        setHtml(dg, 'st' + (d.stage || 0) + '/' + (d.attempts || 0) +
           ' ann' + (d.announceOk || 0) + '/' + (d.announceFail || 0) +
           ' c' + (d.connOk || 0) + '/' + (d.connFail || 0) + 'e' + (d.connErr || 0) +
           ' hs' + (d.hsOk || 0) + '/' + (d.hsFail || 0) + 'e' + (d.hsErr || 0) +
           ' rx' + (d.hsRx || 0) + '/z' + (d.hsZero || 0) +
           ' lan:' + (d.tcp80 == null ? '-' : d.tcp80) + '/' + (d.tcp80Err || 0) +
-          ' pub:' + (d.tcpHi == null ? '-' : d.tcpHi) + '/' + (d.tcpHiErr || 0);
-        remoteLog('stats', { stats: d, engine: ei, diag: dg ? dg.innerHTML : '' });
+          ' pub:' + (d.tcpHi == null ? '-' : d.tcpHi) + '/' + (d.tcpHiErr || 0));
+        // During startup log every stats tick. During steady playback only a
+        // heartbeat every 5 s: fewer XHRs to the dev PC, no piled-up requests.
+        var statsNow = Date.now();
+        if (!playing || statsNow - lastStatsLogAt >= 5000) {
+          lastStatsLogAt = statsNow;
+          // Startup ticks are the "every Play" dump: never throttle them away.
+          remoteLog('stats', { stats: d, engine: ei, diag: dg ? dg.innerHTML : '' }, !playing);
+        }
         // Before playback, fill linearly toward the start-buffer target so
         // every megabyte visibly advances the logo. Once playing, fall back to
         // the real file ratio / browser buffer.
@@ -1022,14 +1110,15 @@ var App = (function () {
         else if (d.streamLen && d.downloaded) setLoaderPct(d.downloaded / d.streamLen * 100);
         else setLoaderPct(bufferedPct());
       }, function () {
+        statsInFlight = false;
         var dg = U.qs('#tl-diag', layer);
         var ei = (window.Engine && window.Engine.getInfo) ? window.Engine.getInfo() : {};
-        if (dg) dg.innerHTML = 'mod:' + (ei.embed ? 'y' : 'n') + ' mime:' + (ei.mime ? 'y' : 'n') +
+        setHtml(dg, 'mod:' + (ei.embed ? 'y' : 'n') + ' mime:' + (ei.mime ? 'y' : 'n') +
           ' init:' + (ei.init || '-') + ' load:' + (ei.loaded ? 'y' : 'n') +
           ' io:' + (ei.stage || '-') + ' pong:' + (ei.pong ? 'y' : 'n') + ' msgs:' + (ei.msgs || 0) +
           ' started:' + (ei.engineStarted ? 'y' : 'n') +
           ' ev:' + (ei.events || []).join(',') +
-          ' | NO LINK to 127.0.0.1:11470';
+          ' | NO LINK to 127.0.0.1:11470');
         remoteLog('nolink', { engine: ei, diag: dg ? dg.innerHTML : '' });
       }, 5000);
     }
@@ -1058,6 +1147,7 @@ var App = (function () {
         stallRecoveries++; stallKicks = 0;
         opts.resumePos = t; resumeDone = false;
         try { player.src = url; player.load(); player.play(); } catch (e) {}
+        setTimeout(function () { reclaimRemoteFocus(true); }, 0);
       } else if (stallKicks <= 2) {
         // First two stalls: a small backward seek re-kicks the decoder/pipeline.
         try { player.currentTime = Math.max(0, t - 2); player.play(); } catch (e) {}
@@ -1080,7 +1170,14 @@ var App = (function () {
           if (layer.className.indexOf('hidden') === -1) loader.className = 'torrent-loader hidden';
         }, 450);
       }
-      playing = true; resetOsd();
+      playing = true;
+      // The fast 250 ms poll is only needed while the logo loads. Once the
+      // picture is up, 1 s is enough for the speed readout and avoids spawning
+      // hundreds of engine HTTP threads per minute.
+      if (!statsSlow && statsTimer) {
+        clearInterval(statsTimer); statsTimer = setInterval(pollStats, 1000); statsSlow = true;
+      }
+      resetOsd();
     });
     player.addEventListener('waiting', function () {
       // Never bring the circular spinner back once the picture is up. The
@@ -1101,7 +1198,8 @@ var App = (function () {
       hideLoadSpinner();
       // Keep the pending-seek guard until the new spot actually advances; no
       // visual spinner is painted over the movie while that happens.
-      setTimeout(hideSeekLoad, 45000);
+      if (seekHideTimer) clearTimeout(seekHideTimer);
+      seekHideTimer = setTimeout(function () { seekHideTimer = null; hideSeekLoad(); }, 45000);
     });
     player.addEventListener('seeked', function () {
       if (!seekPending) return;
@@ -1133,33 +1231,58 @@ var App = (function () {
       if (loader) { loader.className = 'torrent-loader hidden'; stopStatsPolling(); }
       toast(playErrorText(err, lastStats, usingAvPlay));
     });
+    // A video that reaches the end is always watched, even when the final
+    // timeupdate is skipped by the browser/AVPlay. If the Up-next countdown
+    // somehow has not fired yet, play the next episode from here.
+    player.addEventListener('ended', function () {
+      if (!player || layer.className.indexOf('hidden') !== -1) return;
+      saveProgress();
+      var watchedId = opts.videoId || opts.id;
+      if (watchedId) API.markWatched(watchedId, true);
+      remoteLog('ended', { id: opts.id, videoId: opts.videoId, nextId: opts.nextId });
+      if (opts.nextId && !nextAutoFired && !nextAutoCancelled) updateNextCountdown(0);
+    });
     player.addEventListener('timeupdate', function () {
       if (!player.duration) return;
       if (!scrubbing) {
         var pct = player.currentTime / player.duration * 100;
         fillEl.style.width = pct + '%';
         U.qs('#knob', layer).style.left = pct + '%';
-        U.qs('#time', layer).innerHTML = U.fmtTime(player.currentTime) + ' / ' + U.fmtTime(player.duration);
+        // One text node change per second, not per frame: repeated innerHTML
+        // writes were enough to make the old TV's UI stop answering the remote.
+        var txt = U.fmtTime(player.currentTime) + ' / ' + U.fmtTime(player.duration);
+        if (txt !== lastTimeText) { lastTimeText = txt; U.qs('#time', layer).innerHTML = txt; }
       }
       updateSubtitle();
-      // Last minute of an episode: offer the next one, bottom-right.
+      // N minutes before the end: show the Up-next card (same setting that
+      // drives the countdown), preload earlier if requested.
       var remain = player.duration - player.currentTime;
       var nb = U.qs('#next-ep', layer);
       if (nb) {
-        // Shown "Next episode button" minutes before the end (Settings, 1-10).
-        var nextSec = (Number(U.get('nextEpMin', 1)) || 1) * 60;
-        var preSec = (Number(U.get('prefetchMin', 5)) || 5) * 60;
-        if (opts.nextId && remain > 0 && (remain <= preSec || remain <= nextSec) && nextEpisodeHooks)
+        if (opts.nextId && remain > 0 && remain <= preSec && nextEpisodeHooks)
           nextEpisodeHooks.preload();
-        var showNext = !!(opts.nextId && remain <= nextSec && remain > 0);
-        var wasFocused = (' ' + nb.className + ' ').indexOf(' focused ') !== -1;
-        if (!showNext && wasFocused && Focus.get() === nb) Focus.set(seekEl);
-        nb.className = 'next-episode' + (showNext ? ' show' : '') + (showNext && wasFocused ? ' focused' : '');
-        if (showNext && !nextShownLogged) {
-          nextShownLogged = true;
-          remoteLog('nextshow', { nextId: opts.nextId, remain: remain });
-          Focus.set(nb);           // already focused: one OK press plays it
+        var na = U.qs('#next-ep-action', layer);
+        var showNext = !!(opts.nextId && remain > 0 && remain <= nextCountdownSec);
+        var cls = ' ' + nb.className + ' ';
+        var wasFocused = Focus.get() === na || Focus.get() === nb;
+        var wasShown = cls.indexOf(' show ') !== -1;
+        if (!showNext && wasFocused) Focus.set(seekEl);
+        if (showNext !== wasShown) nb.className = 'next-episode' + (showNext ? ' show' : '');
+        if (!showNext && wasShown) resetNextCountdown();
+        // Every appearance focuses the button, not the card, and hides the
+        // video controls. All other Up/Down/OK behaviour stays the same.
+        if (showNext && !wasShown) {
+          resetNextCountdown();
+          Focus.set(na);
+          hideOsd();
+          if (!nextShownLogged) {
+            nextShownLogged = true;
+            remoteLog('nextshow', { nextId: opts.nextId, remain: remain,
+              countdownSec: nextCountdownSec });
+          }
         }
+        if (showNext) updateNextCountdown(remain);
+        else if (opts.nextId && remain <= 0.5) updateNextCountdown(remain);
       }
       // Save every 10 s of movement. Never before the resume seek has happened
       // and never in the first 10 s: the old "every 5%" rule also fired at 0%,
@@ -1232,19 +1355,8 @@ var App = (function () {
         opts.resumePos = t; resumeDone = false;
         var wasPaused = player.paused;
         try { player.src = url; player.load(); if (!wasPaused) player.play(); } catch (e) {}
+        setTimeout(function () { reclaimRemoteFocus(true); }, 0);
         return;
-      }
-      if (U.get('loopVideo', false) && player) {
-        try { player.currentTime = 0; player.play(); } catch (e) {}
-        return;
-      }
-      if (U.get('autoplayNext', false) && opts.nextId) {
-        var nb = U.qs('#next-ep-btn', layer);
-        if (nb && nb.onclick && nb.style.display !== 'none') {
-          toast('Playing next episode');
-          nb.onclick();
-          return;
-        }
       }
       toast('Playback finished'); closeLayers();
     });
@@ -1269,22 +1381,36 @@ var App = (function () {
       var langs = API.SUB_LANGS || [], cur = opts.subLang || U.get('subLang', 'en'), rows = [];
       for (var i = 0; i < langs.length; i++) {
         (function (L) {
-          rows.push({ label: L.name + ' (' + L.code + ')' + (L.code === cur ? '  ✓' : ''), fn: function () {
+          rows.push({ label: L.name + ' (' + L.code + ')', current: L.code === cur, fn: function () {
             U.set('subLang', L.code); opts.subLang = L.code;
             reloadCaptionTracks(L.code);
             toast('Caption language: ' + L.name);
-            openSubtitleMenu();
+            openSubtitleMenu(true, true);   // back to the parent menu
           } });
         })(langs[i]);
       }
       playerMenu('Caption language', rows);
     }
+    function openSubtitleSyncMenu(replace) {
+      var rows = [
+        { label: 'Offset: \u22121 s',
+          fn: function () { adjustSubOffset(-1); openSubtitleSyncMenu(true); } },
+        { label: 'Offset: +1 s',
+          fn: function () { adjustSubOffset(1); openSubtitleSyncMenu(true); } },
+        { label: 'Start here', fn: function () { startSubtitleHere(); openSubtitleSyncMenu(true); } },
+        { label: 'Reset subtitle sync', fn: function () {
+            setSubOffset(0, true); toast('Subtitle sync reset'); openSubtitleSyncMenu(true);
+          } }
+      ];
+      playerMenu('Subtitle sync', rows, replace);
+    }
     function openCaptionSizeMenu() {
       var sizes = ['75%', '100%', '125%', '150%'], cur = U.get('subSize', '100%'), rows = [];
       for (var i = 0; i < sizes.length; i++) {
         (function (s) {
-          rows.push({ label: s + (s === cur ? '  ✓' : ''), fn: function () {
-            U.set('subSize', s); applySubtitleSettings(); openSubtitleMenu();
+          rows.push({ label: s, current: s === cur, fn: function () {
+            U.set('subSize', s); applySubtitleSettings();
+            openCaptionsMenu(true, true);
           } });
         })(sizes[i]);
       }
@@ -1294,53 +1420,40 @@ var App = (function () {
       var cur = String(currentColor()).toLowerCase(), rows = [];
       for (var i = 0; i < SUB_COLORS.length; i++) {
         (function (c) {
-          rows.push({ label: c.name + (String(c.value).toLowerCase() === cur ? '  ✓' : ''), color: c.value,
+          rows.push({ label: c.name, current: String(c.value).toLowerCase() === cur, color: c.value,
             fn: function () {
               U.set('subColor', c.value); applySubtitleSettings();
-              toast('Caption text: ' + c.name); openSubtitleMenu();
+              toast('Caption text: ' + c.name);
+              openCaptionsMenu(true, true);
             } });
         })(SUB_COLORS[i]);
       }
       playerMenu('Caption text', rows);
     }
-    function openSubtitleMenu() {
-      var langName = API.subLangName(opts.subLang || U.get('subLang', 'en'));
-      var rows = [{
-        label: subOn ? 'Turn subtitles off' : 'Turn subtitles on',
-        fn: function () { subOn = !subOn; updateSubtitle(); toast(subOn ? 'Subtitles on' : 'Subtitles off'); }
-      },
-      { label: 'Sync subtitles: ' + subSyncLabel(subOffset) + '  \u2012 1 s',
-        fn: function () { adjustSubOffset(-1); } },
-      { label: 'Sync subtitles: ' + subSyncLabel(subOffset) + '  + 1 s',
-        fn: function () { adjustSubOffset(1); } },
-      { label: 'Set sync START here', fn: function () { markSyncPoint('a'); } },
-      { label: 'Set sync END here', fn: function () { markSyncPoint('b'); } },
-      { label: 'Drift: ' + driftStatus(), fn: function () { clearDrift(); } },
-      { label: 'Reset subtitle sync', fn: function () {
-          clearDrift(); setSubOffset(0, true); toast('Subtitle sync reset');
-        } },
-      { label: 'Caption language: ' + langName + '  ›', fn: openCaptionLangMenu },
-      { label: 'Caption size: ' + U.get('subSize', '100%') + '  ›', fn: openCaptionSizeMenu },
-      { label: 'Caption text: ' + colorName() + '  ›', fn: openCaptionColorMenu }];
-      for (var i = 0; i < subTracks.length; i++) {
-        (function (tr, idx) {
-          var label = (tr.langName || tr.lang || 'Track') + '  •  ' + (tr.label || tr.name || ('Track ' + (idx + 1)));
-          rows.push({ label: label + (tr.url === subUrl ? '  ✓' : ''),
-            fn: function () { loadSubtitles(tr.url); } });
-        })(subTracks[i], i);
-      }
-      rows.push({ label: 'Load subtitle URL…', fn: function () {
-        textInput('Subtitle URL', 'https://', function (u) {
-          if (u && u.indexOf('http') === 0) loadSubtitles(u); else toast('Invalid URL');
-        });
-      } });
-      playerMenu('Subtitles · ' + langName, rows);
+    function openCaptionsMenu(replace, pop) {
+      if (pop && playerMenuStack.length) playerMenuStack.pop();
+      var rows = [
+        { label: 'Caption size', sub: true, fn: openCaptionSizeMenu },
+        { label: 'Caption text', sub: true, fn: openCaptionColorMenu }
+      ];
+      playerMenu('Captions', rows, replace);
     }
-    U.qs('#subtitles', layer).onclick = openSubtitleMenu;
+    function openSubtitleMenu(replace, pop) {
+      if (pop && playerMenuStack.length) playerMenuStack.pop();
+      var langName = API.subLangName(opts.subLang || U.get('subLang', 'en'));
+      var rows = [
+        { label: subOn ? 'Turn subtitles off' : 'Turn subtitles on',
+          fn: function () { subOn = !subOn; updateSubtitle(); toast(subOn ? 'Subtitles on' : 'Subtitles off'); openSubtitleMenu(true); } },
+        { label: 'Language: ' + langName, sub: true, fn: openCaptionLangMenu },
+        { label: 'Sync', sub: true, fn: openSubtitleSyncMenu },
+        { label: 'Captions', sub: true, fn: openCaptionsMenu }
+      ];
+      playerMenu('Subtitles', rows, replace);
+    }
+    U.qs('#subtitles', layer).onclick = function () { openSubtitleMenu(); };
     U.qs('#audio', layer).onclick = function () { playerMenu('Audio', [{ label: 'Default', fn: function () {} }]); };
     U.qs('#mute', layer).onclick = toggleMute;
     U.qs('#speed', layer).onclick = openSpeedMenu;
-    U.qs('#quality', layer).onclick = openPlayerSettings;
     function gotoEpisode(id, dir) {
       if (!id) return;
       remoteLog('episodenav', { dir: dir, id: id });
@@ -1385,6 +1498,11 @@ var App = (function () {
     nextEpisodeHooks = { preload: preloadNext };
     function playNextNow() {
       if (!opts.nextId) return;
+      // Leaving this episode for the next one counts as watching it.
+      nextAutoFired = true;
+      var watchedId = opts.videoId || opts.id;
+      if (watchedId) API.markWatched(watchedId, true);
+      if (saveProgressNow) { try { saveProgressNow(); } catch (e) {} }
       // playStream() rebuilds the layer with its own first-load loader.
       hideLoadSpinner();
       resolveNext(function (s) {
@@ -1400,6 +1518,7 @@ var App = (function () {
     }
     U.qs('#next-ep-btn', layer).onclick = playNextNow;
     U.qs('#next-ep', layer).onclick = playNextNow;
+    U.qs('#next-ep-action', layer).onclick = playNextNow;
     seekEl.onclick = function (ev) {
       Focus.set(seekEl);
       var d = player.duration;
@@ -1417,8 +1536,8 @@ var App = (function () {
     //   LEFT/RIGHT on the seek bar -> scrub; the longer you hold, the faster
     //   UP/DOWN -> cycle through all controls (incl. seek bar)
     //   OK      -> activate the focused control
-    var btnOrder = ['pp', 'prev-ep', 'back10', 'fwd10', 'subtitles', 'audio', 'mute', 'speed', 'quality', 'next-ep-btn'];
-    var ctrlOrder = ['seek'].concat(btnOrder).concat(['next-ep']);
+    var btnOrder = ['pp', 'prev-ep', 'back10', 'fwd10', 'subtitles', 'audio', 'mute', 'speed', 'next-ep-btn'];
+    var ctrlOrder = ['seek'].concat(btnOrder).concat(['next-ep-action']);
     function moveHorizontal(dir) {
       var f = Focus.get(), idx = -1, i;
       for (i = 0; i < btnOrder.length; i++) if (f && f.id === btnOrder[i]) idx = i;
@@ -1431,6 +1550,8 @@ var App = (function () {
     }
     function scrubTick() {
       if (!scrubbing || !scrubDir) return;
+      // If keyup is swallowed by the native plugin, do not spin forever.
+      if (Date.now() - lastScrubKeyAt > 3000) { commitSeek(); return; }
       // 10 s per step at first, rising by 10 s every 250 ms while held.
       var held = Date.now() - scrubHoldAt;
       var step = 10 + Math.min(150, Math.floor(held / 250) * 10);
@@ -1441,6 +1562,7 @@ var App = (function () {
       paintSeek(seekTarget);
     }
     function startScrub(dir) {
+      lastScrubKeyAt = Date.now();
       if (!scrubbing) {
         scrubbing = true;
         seekTarget = (player && player.currentTime) || 0;
@@ -1456,24 +1578,43 @@ var App = (function () {
       if (layer.className.indexOf('hidden') !== -1) return false;
       var pm = U.qs('#pmenu');
       if (pm && pm.className.indexOf('open') !== -1) {
-        // Back closes only the menu; the player stays open.
         if (isBackKey(k)) { closePlayerMenu(); return true; }
-        return false;   // menu owns navigation
+        if (k === 38 || k === 40) { moveMenuFocus(k === 38 ? -1 : 1); return true; }
+        var repeat = !!(ev && ev.repeat);
+        if ((k === 37 || k === 39) && !repeat) {
+          if (k === 39) {
+            if (playerMenuStack.length) parentPlayerMenu(); else closePlayerMenu();
+          } else {
+            // Left opens a submenu; on a leaf it does nothing.
+            var row = playerMenuRows ? playerMenuRows[playerMenuFocus] : null;
+            if (row && row.sub) activateFocusedMenuRow();
+          }
+          return true;
+        }
+        if ((k === 13 || k === 32) && !repeat) { activateFocusedMenuRow(); return true; }
+        return true;   // the drawer owns every key while it is visible
       }
       var osd = U.qs('#osd');
       var nbx = U.qs('#next-ep', layer);
-      var nextFocused = nbx && nbx.className.indexOf(' show') !== -1 && Focus.get() === nbx;
+      var na = U.qs('#next-ep-action', layer);
+      var nextShowing = !!(nbx && nbx.className.indexOf(' show') !== -1);
       if (osd && osd.style.opacity === '0') {
-        // OK on the focused "Next Episode" button plays it right away.
-        if (k === 13 && nextFocused) return false;
-        // OK with the controls hidden: play/pause and show the controls.
-        if (k === 13) { togglePlayback(); return true; }
+        // OK is handled in the capture phase: Next Episode when it is showing,
+        // otherwise Play/Pause when no control has focus.
         // Left/Right with no controller visible: jump immediately instead of
         // only moving the hidden scrub cursor. Ignore key repeat so holding the
         // key does not also start a full scrub on the next event.
         if (k === 37 || k === 39) {
           if (!ev || !ev.repeat) jumpBy(k === 39 ? 10 : -10);
-          showOsd();
+          // The focused Next Episode button must not drag the controls up.
+          if (Focus.get() !== na) showOsd();
+          return true;
+        }
+        if (k === 40 && na && Focus.get() === na) {
+          // Down from the prompt: reveal the controller, which pushes the
+          // prompt upward, and give the seek bar focus.
+          Focus.set(seekEl);
+          showOsd(true);
           return true;
         }
         showOsd();                                    // controls appear with the seek bar focused
@@ -1489,15 +1630,23 @@ var App = (function () {
         return true;
       }
       if (k === 38 || k === 40) {
-        // Up/Down only switch between the seek bar and the button row:
-        // Up from any button -> seek bar, Down from the seek bar -> Play/Pause.
         var cf = Focus.get();
-        if (k === 38 && cf !== seekEl) Focus.set(seekEl);
-        else if (k === 40 && cf === seekEl) Focus.set(U.qs('#pp', layer));
-        showOsd();
+        var onSeek = cf === seekEl;
+        if (k === 40) {
+          // Down always brings up the control row, Next Episode showing or not.
+          showOsd();
+          if (onSeek) Focus.set(U.qs('#pp', layer));
+          return true;
+        }
+        // With the Next Episode prompt on screen, Up from the seek bar reaches
+        // Play/Pause. In every other case Up dismisses the controller.
+        if (nextShowing && onSeek) {
+          Focus.set(U.qs('#pp', layer)); showOsd(); return true;
+        }
+        hideOsd();
         return true;
       }
-      if (k === 13) showOsd();   // OK: let the click happen (10009 is Back)
+      if (k === 13) showOsd();   // OK on a focused control: let the click happen
       return false;
     });
     // Release: play straight from the cursor position (no delayed commit).
@@ -1515,49 +1664,183 @@ var App = (function () {
   }
 
   function isBackKey(k) { return k === 10009 || k === 461 || k === 8 || k === 27; }
+
+  function playerMenuNote(title) {
+    return title === 'Subtitle sync'
+      ? 'Start here = the first subtitle words line up with the spoken words at this playback time.'
+      : '';
+  }
+  function menuFocusEl() {
+    var pm = U.qs('#pmenu');
+    if (!pm) return null;
+    var list = U.qsa('.pm-panel.current .pm-row[data-focus="1"]', pm);
+    return list[playerMenuFocus] || list[0] || null;
+  }
+  function activateMenuRow(r, idx) {
+    if (!r) return;
+    playerMenuFocus = idx;
+    var gen = playerMenuRenderId;
+    if (typeof r.fn === 'function') r.fn();
+    var pm = U.qs('#pmenu');
+    // A leaf action that did not open/replace a menu keeps the drawer open.
+    if (pm && pm.className.indexOf('open') !== -1 && playerMenuRenderId === gen)
+      playerMenu(playerMenuTitle, playerMenuRows, true);
+  }
+  function buildMenuPanel(pm, title, rows, level, total, focusIdx, parentTitle, isCurrent) {
+    var panel = U.el('div', 'pm-panel level-' + level + (isCurrent ? ' current' : ''));
+    panel.style.right = (level * 406) + 'px';
+    panel.style.top = (level * 58) + 'px';
+    panel.style.bottom = (level * 58) + 'px';
+    panel.style.zIndex = String(total - level);
+    var head = '';
+    if (level > 0) head += '<div class="pm-crumb">' + U.esc(parentTitle || '') + ' \u203a</div>';
+    head += '<div class="pm-title">' + U.esc(title) + '</div>';
+    panel.appendChild(U.el('div', 'pm-head', head));
+    var list = U.el('div', 'pm-rows');
+    for (var i = 0; i < rows.length; i++) {
+      (function (r, idx) {
+        var cls = 'pm-row';
+        if (r.current) cls += ' current';
+        if (isCurrent && idx === focusIdx) cls += ' focused';
+        else if (!isCurrent && idx === focusIdx) cls += ' path';
+        var e = U.el('div', cls,
+          '<span class="pm-chev">' + (r.sub ? '\u2039' : '') + '</span>' +
+          '<span class="pm-label">' + U.esc(r.label) + '</span>');
+        if (isCurrent) {
+          e.setAttribute('data-focus', '1');
+          e.onclick = function () { activateMenuRow(r, idx); };
+        }
+        list.appendChild(e);
+      })(rows[i], i);
+    }
+    panel.appendChild(list);
+    if (isCurrent) {
+      var note = playerMenuNote(title);
+      if (note) panel.appendChild(U.el('div', 'pm-note', U.esc(note)));
+    }
+    pm.appendChild(panel);
+  }
+  // V3 continuous split drawer: the root is flush right and full height; every
+  // submenu sits to its left, shorter, more transparent, and softly shadowed.
+  function renderPlayerMenu() {
+    var pm = U.qs('#pmenu');
+    if (!pm) return;
+    var n = playerMenuRows ? playerMenuRows.length : 0;
+    if (!n) playerMenuFocus = 0;
+    else if (playerMenuFocus < 0) playerMenuFocus = 0;
+    else if (playerMenuFocus >= n) playerMenuFocus = n - 1;
+    pm.innerHTML = '';
+    var total = playerMenuStack.length + 1, i, parentTitle;
+    for (i = 0; i < playerMenuStack.length; i++) {
+      parentTitle = i > 0 ? playerMenuStack[i - 1].title : '';
+      buildMenuPanel(pm, playerMenuStack[i].title, playerMenuStack[i].rows || [], i, total,
+        playerMenuFocusStack[i] || 0, parentTitle, false);
+    }
+    parentTitle = playerMenuStack.length ? playerMenuStack[playerMenuStack.length - 1].title : '';
+    buildMenuPanel(pm, playerMenuTitle, playerMenuRows || [], playerMenuStack.length, total,
+      playerMenuFocus, parentTitle, true);
+    pm.className = 'player-menu open';
+    var f = menuFocusEl();
+    if (f) {
+      Focus.set(f);
+      var list = f.parentNode;
+      if (list && typeof list.scrollTop === 'number') {
+        var top = f.offsetTop - list.offsetTop, bottom = top + f.offsetHeight;
+        if (top < list.scrollTop) list.scrollTop = Math.max(0, top - 8);
+        else if (bottom > list.scrollTop + list.clientHeight)
+          list.scrollTop = bottom - list.clientHeight + 8;
+      }
+    }
+    playerMenuRenderId++;
+  }
+  function moveMenuFocus(delta) {
+    var n = playerMenuRows ? playerMenuRows.length : 0;
+    if (!n) return;
+    playerMenuFocus = (playerMenuFocus + delta + n) % n;
+    renderPlayerMenu();
+  }
+  function activateFocusedMenuRow() {
+    activateMenuRow(playerMenuRows ? playerMenuRows[playerMenuFocus] : null, playerMenuFocus);
+  }
+  // `replace` redraws the current level without pushing a Back step; `pop`
+  // returns from a leaf submenu to the row that opened it.
+  function playerMenu(title, rows, replace, pop) {
+    var pm = U.qs('#pmenu');
+    var wasOpen = !!(pm && pm.className.indexOf('open') !== -1);
+    if (!wasOpen) {
+      playerMenuStack = []; playerMenuFocusStack = [];
+      var f = Focus.get();
+      if (f && f.parentNode !== pm && String(f.className || '').indexOf('pm-row') === -1)
+        playerMenuReturnFocus = f;
+      playerMenuFocus = 0;
+    } else if (pop) {
+      if (playerMenuStack.length) {
+        var prev = playerMenuStack.pop();
+        playerMenuFocus = playerMenuFocusStack.length ? playerMenuFocusStack.pop() : 0;
+        playerMenuTitle = prev.title; playerMenuRows = prev.rows || [];
+      } else {
+        playerMenuFocus = 0;
+      }
+    } else if (!replace) {
+      playerMenuStack.push({ title: playerMenuTitle, rows: playerMenuRows || [] });
+      playerMenuFocusStack.push(playerMenuFocus);
+      playerMenuFocus = 0;
+    }
+    playerMenuTitle = title; playerMenuRows = rows || [];
+    renderPlayerMenu();
+  }
+  // Right on a submenu goes one level up; Right on the root closes everything.
+  function parentPlayerMenu() {
+    if (!playerMenuStack.length) return closePlayerMenu();
+    var prev = playerMenuStack.pop();
+    playerMenuFocus = playerMenuFocusStack.length ? playerMenuFocusStack.pop() : 0;
+    playerMenuTitle = prev.title; playerMenuRows = prev.rows || [];
+    renderPlayerMenu();
+    return true;
+  }
+  // Back closes the whole drawer from any level, including every submenu.
   function closePlayerMenu() {
     var pm = U.qs('#pmenu');
     if (!pm || pm.className.indexOf('open') === -1) return false;
-    pm.className = 'player-menu';
+    pm.className = 'player-menu'; pm.innerHTML = '';
+    playerMenuStack = []; playerMenuFocusStack = [];
+    playerMenuTitle = ''; playerMenuRows = null; playerMenuFocus = 0; playerMenuRenderId++;
     var back = playerMenuReturnFocus;
     playerMenuReturnFocus = null;
     if (back && back.parentNode) Focus.set(back);
     else Focus.set(U.qs('#pp'));
     return true;
   }
-  function playerMenu(title, rows) {
-    var pm = U.qs('#pmenu');
-    // Remember the control that opened the first menu so Back returns there,
-    // not to a now-hidden menu row when a submenu replaces it.
-    if (pm && pm.className.indexOf('open') === -1) {
-      var f = Focus.get();
-      if (f && f.parentNode !== pm && String(f.className || '').indexOf('pm-row') === -1)
-        playerMenuReturnFocus = f;
-    }
-    pm.innerHTML = '<div class="pm-title">' + U.esc(title) + '</div>';
-    for (var i = 0; i < rows.length; i++) {
-      (function (r) {
-        var e = U.el('div', 'pm-row', U.esc(r.label)); e.setAttribute('data-focus', '1');
-        e.onclick = function () {
-          pm.className = 'player-menu';
-          if (r.fn) r.fn();
-          // If r.fn opened a submenu, playerMenu() already set focus on its
-          // first row; only refocus the player when the menu really closed.
-          var now = U.qs('#pmenu');
-          if (!now || now.className.indexOf('open') === -1) Focus.set(U.qs('#pp'));
-        };
-        pm.appendChild(e);
-      })(rows[i]);
-    }
-    pm.className = 'player-menu open'; Focus.set(U.qs('.pm-row', pm));
-  }
 
-  function showOsd() {
+  // The Next Episode prompt sits low over the picture. When the controller
+  // opens it is pushed above the seek bar / button row instead of overlapping.
+  function positionNextEp(controlsOpen) {
+    var nb = U.qs('#next-ep');
+    if (nb) nb.style.bottom = controlsOpen ? '250px' : '155px';
+  }
+  function hideOsd() {
+    var osd = U.qs('#osd');
+    if (osd) osd.style.opacity = '0';
+    if (osdTimer) { clearTimeout(osdTimer); osdTimer = null; }
+    positionNextEp(false);
+  }
+  function showOsd(force) {
     var osd = U.qs('#osd');
     var l = U.qs('#torrent-loader');
     if (l && l.className.indexOf('hidden') === -1) return;  // first-load logo owns the screen
+    var nb = U.qs('#next-ep');
+    var na = U.qs('#next-ep-action');
+    // While the Next Episode button has focus, only the prompt is visible.
+    // Down explicitly reveals the controller (it moves focus off the button).
+    if (!force && nb && na && nb.className.indexOf(' show') !== -1 && Focus.get() === na) {
+      if (osd) osd.style.opacity = '0';
+      if (osdTimer) { clearTimeout(osdTimer); osdTimer = null; }
+      positionNextEp(false);
+      return;
+    }
     var wasHidden = osd && osd.style.opacity === '0';
     if (osd) osd.style.opacity = '1';
+    positionNextEp(true);
     // Whenever the controls appear, the seek bar has focus (unless a player
     // menu is open).
     var pm = U.qs('#pmenu'), sk = U.qs('#seek');
@@ -1571,15 +1854,23 @@ var App = (function () {
     }, 3500);
   }
   function stopPlayer(keepEngine) {
+    // Exiting the player cancels the Up-next auto-play; it only happens while
+    // the user is still watching this episode.
+    if (cancelNextAutoplay) { try { cancelNextAutoplay(); } catch (e) {} cancelNextAutoplay = null; }
+    nextEpisodeHooks = null;
     // Store the final position before tearing down (Continue Watching).
     if (saveProgressNow) { try { saveProgressNow(); } catch (e) {} saveProgressNow = null; }
     if (clearSeekTimer) { clearSeekTimer(); clearSeekTimer = null; }
     if (seekKeyupHandler) { document.removeEventListener('keyup', seekKeyupHandler, false); seekKeyupHandler = null; }
+    if (osdTimer) { clearTimeout(osdTimer); osdTimer = null; }
+    Focus.onKey(null);
     playerToggle = null; playerJump = null; playerStop = null; playerInfo = null;
-    playerMute = null; playerVolume = null; playerStep = null;
-    playerMenuReturnFocus = null;
+    playerMute = null; playerVolume = null; playerStep = null; playerOk = null;
+    playerMenuReturnFocus = null; playerMenuStack = []; playerMenuFocusStack = [];
+    playerMenuTitle = ''; playerMenuRows = null; playerMenuFocus = 0; playerMenuRenderId++;
     stopStatsPolling();
     stopStallWatch();
+    remoteLog = function () {};
     // Going straight to the next episode keeps the engine (peers, metadata and
     // the pre-loaded pieces); playStream() then switches its file.
     if (window.Engine && !keepEngine) window.Engine.stop();
@@ -1599,7 +1890,16 @@ var App = (function () {
     updateProfile();
     U.qs('#side-profile').onclick = function () { account(); };
     Focus.onBack(function () { back(); });
-    Focus.onChange(function () { refreshTabIcons(); });
+    Focus.onChange(function () {
+      refreshTabIcons();
+      // Focusing the Next Episode button clears the video controls: the
+      // prompt is the only thing on screen until Down reveals the controller.
+      var pl = U.qs('#player-layer');
+      if (pl && pl.className.indexOf('hidden') === -1) {
+        var nb = U.qs('#next-ep'), na = U.qs('#next-ep-action');
+        if (nb && na && Focus.get() === na && nb.className.indexOf(' show') !== -1) hideOsd();
+      }
+    });
     Focus.setRoot(U.qs('#app'));
     // Capture before Focus.js so all TV remote media keys are handled once.
     // Volume/FF/REW may repeat; one-shot keys ignore auto-repeat.
@@ -1607,21 +1907,36 @@ var App = (function () {
       if (!player) return;
       var k = e.keyCode, handled = false;
       if (k === 415 || k === 19 || k === 179) {
-        if (!e.repeat && playerToggle) playerToggle();
+        if (!e.repeat && playerToggle) { try { playerToggle(); } catch (err) { remoteLog('toggle-error', { message: String(err && err.message || err) }); } }
         handled = !!playerToggle;
-      } else if (k === 412 && playerJump) { playerJump(-30); handled = true; }
-      else if (k === 417 && playerJump) { playerJump(30); handled = true; }
-      else if (k === 413 && playerStop) { if (!e.repeat) playerStop(); handled = true; }
-      else if (k === 457 && playerInfo) { if (!e.repeat) playerInfo(); handled = true; }
-      else if (k === 449 && playerMute) { if (!e.repeat) playerMute(); handled = true; }
-      else if (k === 447 && playerVolume) { playerVolume(0.1); handled = true; }
-      else if (k === 448 && playerVolume) { playerVolume(-0.1); handled = true; }
+      } else if (k === 412 && playerJump) { try { playerJump(-30); } catch (err) {} handled = true; }
+      else if (k === 417 && playerJump) { try { playerJump(30); } catch (err) {} handled = true; }
+      else if (k === 413 && playerStop) { if (!e.repeat) { try { playerStop(); } catch (err) {} } handled = true; }
+      else if (k === 457 && playerInfo) { if (!e.repeat) { try { playerInfo(); } catch (err) {} } handled = true; }
+      else if (k === 449 && playerMute) { if (!e.repeat) { try { playerMute(); } catch (err) {} } handled = true; }
+      else if (k === 447 && playerVolume) { try { playerVolume(0.1); } catch (err) {} handled = true; }
+      else if (k === 448 && playerVolume) { try { playerVolume(-0.1); } catch (err) {} handled = true; }
       else if ((k === 427 || k === 428) && playerStep) {
-        if (!e.repeat) playerStep(k === 427 ? 1 : -1);
+        if (!e.repeat) { try { playerStep(k === 427 ? 1 : -1); } catch (err) {} }
+        handled = true;
+      }
+      // Back is handled in the capture phase so the player can always be
+      // exited even if focus has landed on the AVPlay plugin or a hidden control.
+      else if (isBackKey(k) && !e.repeat) {
+        var pmenu = U.qs('#pmenu');
+        if (pmenu && pmenu.className.indexOf('open') !== -1) closePlayerMenu();
+        else closeLayers();
+        handled = true;
+      } else if (k === 13 && playerOk && playerOk(k, e)) {
         handled = true;
       }
       if (handled) { e.preventDefault(); e.stopPropagation(); }
     }, true);
+    // Re-check every 2 s: if AVPlay or the NaCl embed takes native focus,
+    // keydown never reaches the document and the TV looks completely frozen.
+    if (!focusReclaimTimer) focusReclaimTimer = setInterval(function () {
+      reclaimRemoteFocus(false);
+    }, 2000);
     setTimeout(function () {
       U.qs('#splash').style.display = 'none';
       U.qs('#app').style.display = 'block';
@@ -1643,8 +1958,7 @@ var App = (function () {
     applySubtitleSettings: applySubtitleSettings,
     subSyncText: function () { return subSyncLabel(subOffset); },
     subSyncBy: adjustSubOffset,
-    subSyncSet: function (v) { setSubOffset(v, true); toast('Subtitle sync: ' + subSyncLabel(subOffset)); },
-    driftStatusText: driftStatus };
+    subSyncSet: function (v) { setSubOffset(v, true); toast('Subtitle sync: ' + subSyncLabel(subOffset)); } };
 })();
 
 document.addEventListener('DOMContentLoaded', function () { App.init(); });

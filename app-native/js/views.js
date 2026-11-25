@@ -2,6 +2,16 @@
 var Views = (function () {
 
   function clear(box) { while (box.firstChild) box.removeChild(box.firstChild); }
+  // Document-level listeners installed by a screen must die with that screen.
+  // Otherwise browsing for a while stacks handlers that all run on every key.
+  var viewDisposers = [];
+  function onDispose(fn) { if (viewDisposers.indexOf(fn) < 0) viewDisposers.push(fn); }
+  function disposeViews() {
+    for (var i = 0; i < viewDisposers.length; i++) {
+      try { viewDisposers[i](); } catch (e) {}
+    }
+    viewDisposers = [];
+  }
   // The title currently shown in the info bar — used by "Mark as Watched".
   var infoItem = null;
 
@@ -364,7 +374,13 @@ var Views = (function () {
     }
     document.addEventListener('keydown', onKey, true);
     scroll.addEventListener('scroll', later);
-    if (window.MutationObserver) new MutationObserver(later).observe(scroll, { childList: true, subtree: true });
+    var observer = window.MutationObserver ? new MutationObserver(later) : null;
+    if (observer) observer.observe(scroll, { childList: true, subtree: true });
+    onDispose(function () {
+      document.removeEventListener('keydown', onKey, true);
+      scroll.removeEventListener('scroll', later);
+      if (observer) observer.disconnect();
+    });
     later(); setTimeout(update, 900);        // after the first card gets focus
     return update;
   }
@@ -582,6 +598,7 @@ var Views = (function () {
       if (at >= 0 && at >= catRowEls.length - 2) loadMore();
     }
     document.addEventListener('keydown', onMoreKey, false);
+    onDispose(function () { document.removeEventListener('keydown', onMoreKey, false); });
     function startLoad() {
       if (!document.body.contains(rows)) return;
       API.catalogRows(null, function (data) {
@@ -762,6 +779,7 @@ var Views = (function () {
       });
     }
     document.addEventListener('keydown', onMoreKey, false);
+    onDispose(function () { document.removeEventListener('keydown', onMoreKey, false); });
     function draw() {
       clear(rows);
       discCatEls = [];
@@ -1263,7 +1281,7 @@ var Views = (function () {
 
       var buttons = [];
       if (!ep) {
-        // Movies and shows: no Play or Trailer button — streams are shown below.
+        // Movies and shows: streams are shown below, no separate Play button.
         buttons.push({ label: inLib ? '✓ In Library' : '+ Library', fn: function () {
           if (API.inLibrary(seriesId)) { API.removeLibrary(seriesId); App.toast('Removed from Library'); }
           else {
@@ -1372,7 +1390,7 @@ var Views = (function () {
           App.modal(label, rws);
         });
       }
-      minutesRow('Next episode button', 'nextEpMin', 1, 'When the "Next Episode" button appears');
+      minutesRow('Next episode button', 'nextEpMin', 2, 'When the "Next Episode" card appears and its countdown starts');
       minutesRow('Pre-load next episode', 'prefetchMin', 5, 'When the next episode starts downloading in the background');
     } else if (active === 'Subtitles') {
       var curLang = U.get('subLang', 'en');
@@ -1436,10 +1454,6 @@ var Views = (function () {
           U.set('subAutoSync', !autoSync);
           App.toast('Auto-apply saved sync: ' + (!autoSync ? 'On' : 'Off'));
           settings(box);
-        });
-      row('Drift correction', App.driftStatusText(),
-        'While playing: Subtitles \u2192 Set sync START here, then END near the finish', function () {
-          App.toast('Set both points in the player\u2019s Subtitles menu');
         });
     } else if (active === 'Movie info') {
       var srcNames = { off: 'Off', omdb: 'OMDb', tmdb: 'TMDB', both: 'OMDb + TMDB' };
@@ -1683,5 +1697,6 @@ var Views = (function () {
   }
 
   return { board: board, discover: discover, library: function (b) { discover(b, true); },
-    search: search, meta: meta, settings: settings, addons: addons, clear: clear };
+    search: search, meta: meta, settings: settings, addons: addons,
+    clear: clear, dispose: disposeViews };
 })();

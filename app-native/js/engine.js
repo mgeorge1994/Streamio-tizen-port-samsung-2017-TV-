@@ -77,7 +77,9 @@
   function ping() {
     note('ping');
     send({ cmd: 'ping' });
-    send({ cmd: 'stats' });
+    // Stats are read by the player over HTTP from 127.0.0.1:11470. Sending a
+    // postMessage stats request every 3 s forever only adds work to the PPAPI
+    // thread and can starve the TV's single core during long playback.
     // Re-post the last start command: messages sent before the NaCl instance
     // exists are silently dropped, so retry until the engine confirms it.
     if (lastStart && !info.engineStarted) send(lastStart);

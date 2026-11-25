@@ -14,6 +14,7 @@
     var self = this, av = api(), handlers = {}, durMs = 0, curMs = 0, url = '';
     var prepared = false, wantPlay = false, destroyed = false;
     var rate = 1, volume = 1, muted = false;
+    var loadSeq = 0, pluginListener = listener();
     self.isAvPlay = true;
     self.paused = true;
     self.readyState = 0;
@@ -22,14 +23,19 @@
 
     // AVPlay renders on a video plane behind the page; this object reserves it.
     var obj = document.createElement('object');
+    // Set focus attributes BEFORE type: Tizen can apply native plugin focus as
+    // soon as the type is assigned, after which tabindex is ignored.
+    obj.setAttribute('tabindex', '-1');
+    obj.setAttribute('unselectable', 'on');
     obj.setAttribute('type', 'application/avplayer');
-    obj.style.cssText = 'position:absolute;left:0;top:0;width:1920px;height:1080px';
+    obj.style.cssText = 'position:absolute;left:0;top:0;width:1920px;height:1080px;pointer-events:none';
     container.appendChild(obj);
 
     function emit(type) {
       var list = handlers[type];
       if (!list || destroyed) return;
       for (var i = 0; i < list.length; i++) {
+        if (destroyed) break;
         try { list[i].call(self, { type: type, target: self }); } catch (e) {}
       }
     }
@@ -103,15 +109,18 @@
     self.load = function () {
       if (!av) { fail('AVPlay is not available on this device'); return; }
       if (!url) return;
+      var seq = ++loadSeq;
       prepared = false;
       try {
         try { av.stop(); } catch (e1) {}
         try { av.close(); } catch (e2) {}
         av.open(url);
         av.setDisplayRect(0, 0, 1920, 1080);
-        av.setListener(listener());
+        // One listener object per player: re-registering a fresh object on every
+        // watchdog reload left stale native callbacks alive on Tizen.
+        av.setListener(pluginListener);
         av.prepareAsync(function () {
-          if (destroyed) return;
+          if (destroyed || seq !== loadSeq) return;
           prepared = true;
           try { durMs = av.getDuration() || 0; } catch (e) {}
           self.readyState = 4;
@@ -119,9 +128,11 @@
           emit('canplay');
           if (wantPlay) self.play();
         }, function (err) {
+          if (destroyed || seq !== loadSeq) return;
           fail('AVPlay prepare failed: ' + (err && err.name ? err.name : err));
         });
       } catch (e) {
+        if (destroyed || seq !== loadSeq) return;
         fail('AVPlay: ' + (e && e.message ? e.message : e));
       }
     };
@@ -138,16 +149,24 @@
     };
     function seek(sec) {
       if (!prepared || destroyed) return;
+      var seq = loadSeq;
       var ms = Math.max(0, Math.floor((Number(sec) || 0) * 1000));
       curMs = ms;            // like <video>: currentTime reports the target while seeking
       emit('seeking');
       try {
-        av.seekTo(ms, function () { curMs = ms; emit('seeked'); emit('timeupdate'); },
-                      function () { emit('seeked'); });
-      } catch (e) { emit('seeked'); }
+        av.seekTo(ms, function () {
+          if (destroyed || seq !== loadSeq) return;
+          curMs = ms; emit('seeked'); emit('timeupdate');
+        }, function () {
+          if (destroyed || seq !== loadSeq) return;
+          emit('seeked');
+        });
+      } catch (e) { if (!destroyed && seq === loadSeq) emit('seeked'); }
     }
     self.destroy = function () {
       destroyed = true;
+      loadSeq++;
+      try { if (av && av.setListener) av.setListener({}); } catch (e) {}
       try { av.stop(); } catch (e1) {}
       try { av.close(); } catch (e2) {}
       if (obj.parentNode) obj.parentNode.removeChild(obj);
