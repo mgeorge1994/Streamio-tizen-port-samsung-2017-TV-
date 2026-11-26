@@ -161,6 +161,116 @@ var Focus = (function () {
     for (var i = 0; i < list.length; i++) if (visible(list[i])) out.push(list[i]);
     return out;
   }
+
+  /* Series details: season tabs wrap onto several rows above the episode
+     grid. Up/Down moves between those tab rows and then into the episodes;
+     with a single tab row it goes straight between tabs and episodes. */
+  function ancestorWithClass(el, c) {
+    var p = el;
+    while (p && p !== document.body) {
+      if (hasClass(p, c)) return p;
+      p = p.parentNode;
+    }
+    return null;
+  }
+  function isSeasonTab(el) { return hasClass(el, 'st-tab') && !!ancestorWithClass(el, 'season-tabs'); }
+  function isEpisodeCard(el) { return hasClass(el, 'ep-card') && !!ancestorWithClass(el, 'ep-grid'); }
+  function visualRows(items) {
+    var rows = [], lastTop = null;
+    for (var i = 0; i < items.length; i++) {
+      if (!visible(items[i])) continue;
+      var top = items[i].offsetTop;
+      if (lastTop === null || Math.abs(top - lastTop) > 8) {
+        rows.push([]);
+        lastTop = top;
+      }
+      rows[rows.length - 1].push(items[i]);
+    }
+    return rows;
+  }
+  function indexIn(list, el) {
+    for (var i = 0; i < list.length; i++) if (list[i] === el) return i;
+    return -1;
+  }
+  function rowIndexOf(rows, el) {
+    for (var i = 0; i < rows.length; i++) if (indexIn(rows[i], el) >= 0) return i;
+    return -1;
+  }
+  function nearestByX(list, x) {
+    var best = list[0], bd = 1e9;
+    for (var i = 0; i < list.length; i++) {
+      var r = list[i].getBoundingClientRect();
+      var d = Math.abs((r.left + r.width / 2) - x);
+      if (d < bd) { bd = d; best = list[i]; }
+    }
+    return best;
+  }
+  function seriesGridNav(dir) {
+    if (!current) return false;
+    if (isSeasonTab(current)) {
+      var strip = ancestorWithClass(current, 'season-tabs');
+      if (!strip) return false;
+      var rows = visualRows(strip.querySelectorAll('.st-tab'));
+      var ri = rowIndexOf(rows, current);
+      if (ri < 0) return false;
+      var r0 = current.getBoundingClientRect();
+      var x = r0.left + r0.width / 2;
+      if (dir === 'left' || dir === 'right') {
+        var idx = indexIn(rows[ri], current), next = null;
+        if (dir === 'right') {
+          next = rows[ri][idx + 1];
+          if (!next) {                       // past the row: next row, or first tab
+            var nextRow = rows[ri + 1] || rows[0];
+            next = nextRow[0];
+          }
+        } else if (idx === rows[ri].length - 1) {
+          // Left at the last tab continues on the next row, as requested.
+          var nextRow2 = rows[ri + 1] || rows[0];
+          next = nextRow2[0];
+        } else if (idx === 0) {
+          var prevRow = rows[ri - 1] || rows[rows.length - 1];
+          next = prevRow[prevRow.length - 1];
+        } else {
+          next = rows[ri][idx - 1];
+        }
+        if (next) { set(next); return true; }
+        return false;
+      }
+      if (dir === 'up') {
+        if (ri > 0) { set(nearestByX(rows[ri - 1], x)); return true; }
+        return false;   // header buttons above the first row
+      }
+      if (dir === 'down') {
+        if (ri < rows.length - 1) { set(nearestByX(rows[ri + 1], x)); return true; }
+        var vp = ancestorWithClass(current, 'season-tabs-viewport');
+        var host = vp && vp.parentNode;
+        var grid = host && host.querySelector ? host.querySelector('.ep-grid') : null;
+        var eps = grid ? visualRows(grid.querySelectorAll('.ep-card')) : [];
+        if (eps.length) { set(nearestByX(eps[0], x)); return true; }
+      }
+      return false;
+    }
+    if (isEpisodeCard(current)) {
+      if (dir !== 'up' && dir !== 'down') return false;
+      var grid2 = ancestorWithClass(current, 'ep-grid');
+      if (!grid2) return false;
+      var eps2 = visualRows(grid2.querySelectorAll('.ep-card'));
+      var ei = rowIndexOf(eps2, current);
+      if (ei < 0) return false;
+      var r = current.getBoundingClientRect();
+      var ex = r.left + r.width / 2;
+      var step = dir === 'down' ? 1 : -1;
+      var nextRow = eps2[ei + step];
+      if (nextRow) { set(nearestByX(nextRow, ex)); return true; }
+      if (dir === 'up') {
+        var host2 = grid2.parentNode && grid2.parentNode.parentNode;
+        var strip2 = host2 && host2.querySelector ? host2.querySelector('.season-tabs') : null;
+        var tabRows = strip2 ? visualRows(strip2.querySelectorAll('.st-tab')) : [];
+        if (tabRows.length) { set(nearestByX(tabRows[tabRows.length - 1], ex)); return true; }
+      }
+    }
+    return false;
+  }
   // Nearest focusable item in the left navigation bar, matched by vertical position.
   function sidebarTarget(y) {
     var remembered = rememberedSidebar();
@@ -284,6 +394,9 @@ var Focus = (function () {
       return;
     }
 
+    // Series season/episode grid: wrapped tab rows and video-card rows.
+    if (seriesGridNav(dir)) return;
+
     // Search owns Down until focus is already inside the results.
     if (searchDownToResults(dir)) return;
 
@@ -373,20 +486,26 @@ var Focus = (function () {
     else if (k === 39) { move('right'); ev.preventDefault(); }
     else if (k === 40) { move('down'); ev.preventDefault(); }
     else if (k === 13 || k === 32) {
+      ev.preventDefault();
+      // A held OK key repeats on Tizen. Only the first keydown may start the
+      // long-press timer, otherwise it fires again after every repeat.
+      if (ev.repeat) return;
       var el = current;
-      if (el && hasClass(el, 'cw-card') && typeof el.onlongok === 'function') {
-        // Hold OK to open the torrent list; a quick tap still resumes playback.
+      if (el && typeof el.onlongok === 'function') {
+        // Hold OK on any card that defines a long-press action (Continue
+        // Watching and now every series card); a quick tap keeps its normal
+        // click behaviour.
         if (!okTimer) {
           okEl = el; okLongFired = false;
           okTimer = setTimeout(function () {
             okTimer = null; okLongFired = true;
-            try { okEl.onlongok(); } catch (e) {}
+            var target = okEl; okEl = null;
+            if (target) { try { target.onlongok(); } catch (e) {} }
           }, 600);
         }
       } else if (el) {
         el.click();
       }
-      ev.preventDefault();
     } else if (k === 10009 || k === 461 || k === 8 || k === 27) {
       // Tizen remote Back is 10009; 461/8/27 cover older/web remotes.
       if (backHandler) { ev.preventDefault(); backHandler(); }

@@ -14,6 +14,10 @@
     var self = this, av = api(), handlers = {}, durMs = 0, curMs = 0, url = '';
     var prepared = false, wantPlay = false, destroyed = false;
     var rate = 1, volume = 1, muted = false;
+    // A paused AVPlay HTTP connection is closed by the local server after its
+    // send timeout. Reopening keeps the requested start position here so the
+    // exact frame is restored on the fresh connection.
+    var pendingSeek = -1, seekAt = 0;
     var loadSeq = 0, pluginListener = listener();
     self.isAvPlay = true;
     self.paused = true;
@@ -42,6 +46,32 @@
     function fail(msg) {
       self.error = { code: 4, message: String(msg || 'AVPlay error') };
       setTimeout(function () { emit('error'); }, 0);
+    }
+    // AVPlay can silently keep decoding after pause(), which left the wrapper
+    // reporting paused=true while the picture kept moving. The next Play key
+    // then called play() again, so the video looked impossible to pause.
+    // Confirm against the native state when available, and use advancing
+    // playtime as the fallback on firmwares without getState().
+    function syncPlayingState(ms) {
+      if (destroyed) return;
+      // Old playtime callbacks can arrive while a seek is landing. They must
+      // not be mistaken for the paused picture having resumed by itself.
+      if (seekAt && Date.now() - seekAt < 1500) return;
+      var s = '';
+      try { s = av && av.getState ? String(av.getState() || '') : ''; } catch (e) {}
+      if (s === 'PLAYING') {
+        // Only undo a pause when the native clock really moved. A stale
+        // PLAYING state on the first callback after pause() is not enough.
+        if (self.paused && typeof ms === 'number' && ms > curMs + 300) {
+          self.paused = false; emit('play'); emit('playing');
+        }
+      } else if (s === 'PAUSED' || s === 'PREPARED' || s === 'IDLE' || s === 'NONE') {
+        // While play() is being requested, a transient PAUSED/IDLE state is
+        // not a user pause; keep the wrapper in the playing state.
+        if (!self.paused && !wantPlay) { self.paused = true; emit('pause'); }
+      } else if (typeof ms === 'number' && self.paused && ms > curMs + 300) {
+        self.paused = false; emit('play'); emit('playing');
+      }
     }
     self.addEventListener = function (type, fn) { (handlers[type] = handlers[type] || []).push(fn); };
     self.removeEventListener = function (type, fn) {
@@ -94,6 +124,7 @@
           if (!self.paused) emit('playing');
         },
         oncurrentplaytime: function (ms) {
+          syncPlayingState(ms);
           curMs = ms;
           if (!durMs) { try { durMs = av.getDuration() || 0; } catch (e) {} }
           emit('timeupdate');
@@ -124,6 +155,13 @@
           prepared = true;
           try { durMs = av.getDuration() || 0; } catch (e) {}
           self.readyState = 4;
+          // A reopen after a stale connection must land on the same frame.
+          if (pendingSeek >= 0) {
+            var at = pendingSeek;
+            pendingSeek = -1;
+            curMs = at * 1000;
+            seek(at);
+          }
           emit('loadedmetadata');
           emit('canplay');
           if (wantPlay) self.play();
@@ -139,18 +177,35 @@
     self.play = function () {
       wantPlay = true;
       if (!prepared || destroyed) return;
-      try { av.play(); self.paused = false; emit('play'); emit('playing'); } catch (e) {}
+      try { av.play(); } catch (e) { return; }
+      self.paused = false; emit('play'); emit('playing');
+      setTimeout(function () { syncPlayingState(); }, 250);
     };
     self.pause = function () {
       wantPlay = false;
       try { av.pause(); } catch (e) {}
       self.paused = true;
       emit('pause');
+      // If the native pipeline really kept running, oncurrentplaytime keeps
+      // arriving and syncPlayingState() corrects the wrapper. Do not poll the
+      // native state here: M47 briefly reports PLAYING right after pause(),
+      // which would undo a perfectly good pause.
+    };
+    // Reopen the same URL on a fresh local HTTP connection, then land on `sec`.
+    // Used after long pauses, seeks, and AVPlay connection errors.
+    self.reopen = function (sec, play) {
+      if (destroyed || !url) return false;
+      wantPlay = !!play;
+      pendingSeek = Math.max(0, Number(sec) || 0);
+      curMs = pendingSeek * 1000;
+      self.load();
+      return true;
     };
     function seek(sec) {
       if (!prepared || destroyed) return;
       var seq = loadSeq;
       var ms = Math.max(0, Math.floor((Number(sec) || 0) * 1000));
+      seekAt = Date.now();
       curMs = ms;            // like <video>: currentTime reports the target while seeking
       emit('seeking');
       try {

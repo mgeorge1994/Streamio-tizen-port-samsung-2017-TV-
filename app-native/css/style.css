@@ -15,9 +15,10 @@ img{border:0}
 ::-webkit-scrollbar{width:0;height:0}
 
 /* ---------- splash ---------- */
-#splash{position:fixed;left:0;top:0;width:1920px;height:1080px;background:#0C0B11;z-index:200;display:block}
-/* Boot logo: 68% of the 1920 px screen (15% smaller), centred both ways. */
-.splash-logo{position:absolute;left:50%;top:50%;width:1306px;height:727px;margin:-364px 0 0 -653px;
+#splash{position:fixed;left:0;top:0;width:1920px;height:1080px;background:#0C0C0C;z-index:200;display:block}
+/* Boot logo: 40% of the 1920 px screen, centred both ways. The PNG's own
+   background is #0C0C0C, so the splash uses that exact colour. */
+.splash-logo{position:absolute;left:50%;top:50%;width:768px;height:428px;margin:-214px 0 0 -384px;
   background:url('../assets/icons/stremio_logo_dark.png') no-repeat center/contain;animation:pulse 1.4s ease-in-out infinite}
 @keyframes pulse{0%,100%{opacity:.55;transform:scale(.96)}50%{opacity:1;transform:scale(1)}}
 
@@ -203,6 +204,16 @@ body.page-loading .tab.focused .bar{background:#7B5BF5}
 /* stream provider tabs + season tabs — underline only, selected tab gets an
    indigo bottom border (no filled background) */
 .stream-tabs,.season-tabs{white-space:nowrap;margin-bottom:18px}
+/* Season tabs wrap onto multiple rows in a container as wide as the three
+   video cards in one episode row. No clipping and no horizontal sliding. */
+.season-tabs-viewport{width:1558px;margin-bottom:18px}
+.season-tabs-viewport.compact{margin-bottom:8px}
+.season-tabs{width:100%;white-space:normal;margin-bottom:0;max-width:none}
+.season-tabs .st-tab{margin-bottom:8px}
+/* Same close gap after the last tab row for any number of rows. */
+.md-scroll.season-compact{padding-top:80px;
+  -webkit-mask-image:linear-gradient(to bottom,rgba(0,0,0,0) 0,#000 80px);
+  mask-image:linear-gradient(to bottom,rgba(0,0,0,0) 0,#000 80px)}
 .stream-tabs .st-tab,.season-tabs .st-tab{display:inline-block;padding:10px 22px;margin-right:10px;
   font-size:21px;font-weight:600;color:rgba(255,255,255,.55);background:transparent;
   border-bottom:3px solid transparent;border-radius:0;outline:none;cursor:pointer}
@@ -344,6 +355,10 @@ body.page-loading .tab.focused .bar{background:#7B5BF5}
 /* YouTube-style bottom fade: title, description and controls share one scrim. */
 .player-osd::before{content:"";position:absolute;left:0;bottom:0;width:1920px;height:430px;z-index:0;pointer-events:none;
   background:linear-gradient(to top,rgba(0,0,0,.94) 0%,rgba(0,0,0,.72) 42%,rgba(0,0,0,0) 100%)}
+/* Local device clock, top-right of the controls screen. */
+.osd-clock{position:absolute;right:100px;top:100px;z-index:2;font-size:40px;line-height:1;font-weight:600;
+  letter-spacing:2px;color:rgba(255,255,255,.68);text-shadow:0 2px 10px rgba(0,0,0,.75)}
+.osd-clock:empty{display:none}
 /* Title, quality/seeders/speed and description sit directly above the seek bar. */
 .osd-top{position:absolute;left:100px;right:100px;bottom:226px;z-index:1;background:none}
 .osd-title{font-size:46px;line-height:1.1;font-weight:700;text-shadow:0 2px 12px rgba(0,0,0,.8)}
@@ -354,8 +369,10 @@ body.page-loading .tab.focused .bar{background:#7B5BF5}
 .osd-desc:empty{display:none}
 .osd-bottom{position:absolute;left:0;bottom:0;width:1920px;height:300px;z-index:1;background:none}
 .seekbar{position:absolute;left:100px;right:100px;bottom:170px;height:10px;border-radius:5px;background:rgba(255,255,255,.28);margin:0}
-.seekbar .fill{position:absolute;left:0;top:0;height:10px;border-radius:5px;background:#7B5BF5;width:0}
-.seekbar .knob{position:absolute;top:-9px;width:28px;height:28px;border-radius:50%;background:#7B5BF5;left:0;margin-left:-14px;display:none}
+/* Light-purple ready range: pieces already cached on the TV (safe to skip to). */
+.seekbar .buffered{position:absolute;left:0;top:0;height:10px;border-radius:5px;background:rgba(123,91,245,.35);width:0}
+.seekbar .fill{position:absolute;left:0;top:0;height:10px;border-radius:5px;background:#7B5BF5;width:0;z-index:1}
+.seekbar .knob{position:absolute;top:50%;width:28px;height:28px;border-radius:50%;background:#5C3FCB;left:0;margin-left:-14px;transform:translateY(-50%);display:none;z-index:2}
 .seekbar.focused .knob,.seekbar.scrubbing .knob{display:block}
 .player-controls{position:absolute;left:100px;right:100px;bottom:62px;display:block;white-space:nowrap;height:74px}
 /* icon-only controls — no circular button chrome */
@@ -407,15 +424,25 @@ body.page-loading .tab.focused .bar{background:#7B5BF5}
 .ne-title{font-size:21px;line-height:28px;font-weight:700;color:#fff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
   text-shadow:0 2px 6px rgba(0,0,0,.85)}
 .ne-progress{height:4px;margin-top:9px;width:0;border-radius:2px;background:#2ECC71;box-shadow:0 0 8px rgba(46,204,113,.6)}
-.ne-action{flex:none;margin-left:18px;padding:14px 20px;border-radius:10px;background:rgba(46,204,113,.7);color:#06210f;
+.ne-action{flex:none;margin-left:18px;padding:14px 20px;border-radius:10px;
+  background:rgba(46,204,113,.16);color:#2ECC71;border:2px solid rgba(46,204,113,.5);
   font-size:21px;font-weight:700;outline:none;pointer-events:auto;white-space:nowrap}
-/* Focus changes only the button background — no ring, arrow, checkmark or scaling. */
-.ne-action.focused{background:#2ECC71;outline:none;transform:none}
-.loading{position:absolute;left:50%;top:50%;width:80px;height:80px;margin:-40px;border:6px solid rgba(255,255,255,.2);border-top-color:#7B5BF5;border-radius:50%;animation:spin 1s linear infinite;display:none}
+/* Unfocused is the same deep-green button with a green border and bright green
+   text as "Mark as Watched". Focused is the flat solid green Watched state:
+   dark text, no border, no ring. */
+.ne-action.focused{background:#2ECC71;color:#06210f;border-color:transparent;box-shadow:none;outline:none;transform:none}
+.loading{position:absolute;left:50%;top:50%;width:80px;height:80px;margin:-40px;border:6px solid rgba(255,255,255,.2);border-top-color:#7B5BF5;border-radius:50%;
+  -webkit-animation:spin 1s linear infinite;animation:spin 1s linear infinite;display:none}
 .loading.show{display:block}
 
 /* Android-TV-style torrent loading: logo fills as the video buffers. */
-.torrent-loader{position:absolute;left:50%;top:50%;width:980px;margin-left:-490px;margin-top:-160px;text-align:center;opacity:1;transition:opacity .4s;pointer-events:none;z-index:5}
+/* Full-screen black sheet above the video, below the loader info. On exit the
+   black fades in 1 s while the logo/text fade faster, in 0.5 s, into the picture. */
+.tl-curtain{position:absolute;left:0;top:0;width:1920px;height:1080px;background:#000;opacity:1;
+  transition:opacity 1s linear;pointer-events:none;z-index:4}
+.tl-curtain.hidden{opacity:0}
+.torrent-loader{position:absolute;left:50%;top:50%;width:980px;margin-left:-490px;margin-top:-160px;text-align:center;opacity:1;
+  transition:opacity .5s linear;pointer-events:none;z-index:5}
 .torrent-loader.hidden{opacity:0}
 .tl-logo{position:relative;width:600px;height:220px;margin:0 auto 34px;overflow:hidden}
 .tl-logo-base,.tl-logo-color{position:absolute;left:0;top:0;width:600px;height:220px;background-repeat:no-repeat;background-position:center;background-size:contain}
@@ -445,6 +472,7 @@ body.page-loading .tab.focused .bar{background:#7B5BF5}
   background-position:left center;background-size:contain;pointer-events:none;opacity:0;
   transition:opacity .2s;z-index:2}
 .paused-logo.show{opacity:1}
+@-webkit-keyframes spin{to{-webkit-transform:rotate(360deg);transform:rotate(360deg)}}
 @keyframes spin{to{transform:rotate(360deg)}}
 #keyboard-layer,#modal-layer{z-index:130}
 .subtitle{position:absolute;left:50%;bottom:180px;transform:translateX(-50%);width:1600px;text-align:center;

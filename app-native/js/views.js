@@ -429,18 +429,30 @@ var Views = (function () {
   }
   function makeCard(item, type, onFocus) {
     var c = U.el('div', 'card');
+    var cardType = item.type || type || '';
     c.setAttribute('data-focus', '1');
     if (item.id) c.setAttribute('data-id', String(item.id));   // restore Discover focus
     c.innerHTML = U.posterHtml(item, true);
+    // Long-press on a series opens the Android-style episodes screen with the
+    // last watched season preselected and that episode focused. A quick tap is
+    // unchanged (Continue Watching resumes, other cards open their page).
+    function openSeriesEpisodes() {
+      var m = /^([^:]+):\d+:\d+$/.exec(String(item.videoId || item.id || ''));
+      var sid = (cardType === 'series' && item.id) ? item.id : (m ? m[1] : item.id);
+      if (sid) App.openMeta(sid, 'series');
+    }
     if (item._resume) {
       // Continue Watching cards show a Play button and resume the last torrent.
-      // Holding OK opens the torrent list for that movie/episode instead.
+      // Holding OK opens the torrent list for movies, the episode grid for shows.
       c.className += ' cw-card';
       c.onlongok = function () {
-        App.openMeta(item.videoId || item.id, item.type || type);
+        if (cardType === 'series') openSeriesEpisodes();
+        else App.openMeta(item.videoId || item.id, cardType);
       };
       var po = c.querySelector('.poster');
       if (po) po.appendChild(U.el('span', 'cw-play'));
+    } else if (cardType === 'series') {
+      c.onlongok = openSeriesEpisodes;
     }
     c.onclick = function () {
       // Continue Watching resumes the exact torrent played last time;
@@ -1002,7 +1014,7 @@ var Views = (function () {
       for (var i = 0; i < metaData.videos.length; i++) {
         var v = metaData.videos[i];
         if (Number(v.season) === season && Number(v.episode) === episode) {
-          return name + ' — S' + season + ' E' + episode + ((v.title || v.name) ? '  •  ' + (v.title || v.name) : '');
+          return name + ' — S' + season + ' E' + episode + ((v.title || v.name) ? ' • ' + (v.title || v.name) : '');
         }
       }
       return name + ' — S' + season + ' E' + episode;
@@ -1255,10 +1267,13 @@ var Views = (function () {
       initial = targetEp.season;
     }
 
+    var tabsViewport = U.el('div', 'season-tabs-viewport');
     var tabs = U.el('div', 'season-tabs');
     var grid = U.el('div', 'ep-grid');
-    body.appendChild(tabs);
-    body.appendChild(mdScroller(grid));   // only the episodes scroll
+    tabsViewport.appendChild(tabs);
+    var scroller = mdScroller(grid);   // only the episodes scroll
+    body.appendChild(tabsViewport);
+    body.appendChild(scroller);
 
     function paint(season) {
       clear(grid);
@@ -1289,6 +1304,7 @@ var Views = (function () {
           grid.appendChild(card);
         })(vids[v]);
       }
+      fitSeasonLayout();   // width + single-row spacing for the new season
     }
     for (var t = 0; t < seasons.length; t++) {
       (function (season) {
@@ -1311,6 +1327,29 @@ var Views = (function () {
       })(seasons[t]);
     }
     paint(initial);
+    // The tabs container is exactly as wide as the three video cards in one
+    // episode row (3 x 506 + 2 x 20 = 1558 px), so the tabs wrap onto multiple
+    // rows above the same width. Layout pixels keep it exact despite zoom or
+    // the focused card's scale transform.
+    function fitSeasonLayout() {
+      if (!grid || !tabsViewport) return;
+      var cards = grid.querySelectorAll('.ep-card');
+      var card = cards.length > 2 ? cards[2] : cards[cards.length - 1];
+      if (!card) return;
+      var width = card.offsetLeft + card.offsetWidth - tabsViewport.offsetLeft;
+      if (width > 0) tabsViewport.style.width = width + 'px';
+
+      // Keep the same close gap after the last tab row whether there is one
+      // row or several. The fade is shortened to match the tighter spacing.
+      tabsViewport.className = 'season-tabs-viewport compact';
+      if (scroller) {
+        scroller.className = 'md-scroll season-compact';
+        scroller.setAttribute('data-fade-top', '80');
+      }
+    }
+    fitSeasonLayout();
+    setTimeout(fitSeasonLayout, 0);
+    setTimeout(fitSeasonLayout, 360);
     // Land on the last watched episode in that season (or the first one),
     // never on the season strip.
     var cards = grid.querySelectorAll('.ep-card'), firstEp = cards[0];
@@ -1319,7 +1358,6 @@ var Views = (function () {
     }
     // The scroller gets its real height on a timer, so Focus.set() can run
     // before it is scrollable. Re-assert visibility after both fit passes.
-    var scroller = grid.parentNode;
     function ensureEpisodeVisible() {
       if (!firstEp || !scroller || !document.body.contains(firstEp)) return;
       var pr = scroller.getBoundingClientRect(), er = firstEp.getBoundingClientRect();
@@ -1354,16 +1392,19 @@ var Views = (function () {
       clear(content);
       var info = d.releaseInfo ? U.esc(d.releaseInfo) : '';
       var rating = d.imdbRating ? '★ ' + U.esc(d.imdbRating) : '';
-      var sub = '';
+      var sub = '', v = null, desc = d.description || '';
       if (ep) {
-        var v = findVideo(d, ep.season, ep.episode);
+        v = findVideo(d, ep.season, ep.episode);
         sub = '<span class="md-ep">' + U.esc(epCode(ep)) + (v && (v.title || v.name) ? '  •  ' + U.esc(v.title || v.name) : '') + '</span>  •  ';
+        // The torrent list for a series is an episode screen: show that
+        // episode's synopsis, not the show-level description.
+        if (v) desc = v.overview || v.description || desc;
       }
       content.innerHTML =
         '<div class="md-title">' + U.esc(d.name || '') + '</div>' +
         '<div class="md-sub">' + sub + info + (rating ? '  •  ' + rating : '') + '  •  ' + U.esc(d.type || kindType) + '</div>' +
         '<div class="md-extra" id="md-extra"></div>' +
-        '<div class="md-desc">' + U.esc(d.description || '') + '</div>' +
+        '<div class="md-desc">' + U.esc(desc || '') + '</div>' +
         '<div class="md-actions" id="md-actions"></div>' +
         '<div id="md-body" style="width:1690px"></div>';
 
@@ -1488,6 +1529,12 @@ var Views = (function () {
       row('Player', 'TV video + AVPlay', 'Browser video first; Samsung AVPlay for formats it cannot decode');
       row('Streaming server', 'On this TV', 'Built-in torrent engine (127.0.0.1:11470) - no PC needed');
       row('Open external player', 'Off', 'Use Sideload Launcher if needed');
+      var showClock = U.get('showClock', true) !== false;
+      row('Show clock', showClock ? 'On' : 'Off', 'Local time in the top-right of the player controls', function () {
+        U.set('showClock', !showClock);
+        App.toast('Show clock: ' + (!showClock ? 'On' : 'Off'));
+        settings(box);
+      });
       function minutesRow(label, key, def, hint) {
         var cur = Number(U.get(key, def)) || def;
         row(label, cur + ' min before the end', hint, function () {
@@ -1548,7 +1595,8 @@ var Views = (function () {
         App.modal('Subtitle color', colorRows);
       });
       row('Subtitle sync', App.subSyncText(), 'Positive delays the subtitles. Saved per video.', function () {
-        var syncRows = [], steps = [-5, -3, -1, -0.5, 0.5, 1, 3, 5];
+        // Positive offsets first, so +1 sits above -1 in the modal list.
+        var syncRows = [], steps = [5, 3, 1, 0.5, -0.5, -1, -3, -5];
         for (var di = 0; di < steps.length; di++) {
           (function (d) {
             syncRows.push({ label: (d > 0 ? '+' : '') + d + ' s', fn: function () {
@@ -1809,5 +1857,5 @@ var Views = (function () {
 
   return { board: board, discover: discover, library: function (b) { discover(b, true); },
     search: search, meta: meta, settings: settings, addons: addons,
-    clear: clear, dispose: disposeViews };
+    displayTitle: displayTitle, clear: clear, dispose: disposeViews };
 })();

@@ -188,6 +188,23 @@ var App = (function () {
     if (history.length) { var prev = history.pop(); navigate(prev.name, prev.params, true); }
     else { navigate('board', {}, true); }
   }
+  // Back MUST exit the video player. A native plugin can swallow the keydown,
+  // so both keydown and keyup route here and a short debounce fires it once.
+  function handlePlayerBack(key) {
+    var now = Date.now();
+    if (now - lastBackHandled < 300) return true;
+    lastBackHandled = now;
+    var pmenu = U.qs('#pmenu'), pl = U.qs('#player-layer');
+    remoteLog('back-key', { key: key || 0, player: !!player,
+      playerOpen: !!(pl && pl.className.indexOf('hidden') === -1),
+      menuOpen: !!(pmenu && pmenu.className.indexOf('open') !== -1) }, true);
+    if (pmenu && pmenu.className.indexOf('open') !== -1) { closePlayerMenu(); return true; }
+    // Pull focus off AVPlay/NaCl before closing, or the next remote key can be
+    // eaten by the plugin after the HTML layer is gone.
+    reclaimRemoteFocus(true);
+    closeLayers();
+    return true;
+  }
   function openMeta(id, type, opts) {
     if (!id) return;
     var p = { id: id, type: type || 'movie' };
@@ -224,7 +241,10 @@ var App = (function () {
     var cached = API.cachedMeta(type === 'series' ? 'series' : 'movie', item.id);
     if (cached && cached.meta) meta = cached.meta;
     var parsed = API.parseStream(s);
-    playStream(s, meta, { title: item.name, quality: parsed.quality, seeders: parsed.seeders,
+    // Series cards use the exact player title: Show — Sx Ey • Episode title.
+    // Continue Watching used to pass only item.name, which lost the episode.
+    var title = (Views.displayTitle && meta && meta.videos) ? Views.displayTitle(meta, vid) : item.name;
+    playStream(s, meta, { title: title, quality: parsed.quality, seeders: parsed.seeders,
       progressId: pid, resumePos: resume, videoId: vid, mediaType: type });
   }
 
@@ -239,8 +259,12 @@ var App = (function () {
     if (pl.className.indexOf('hidden') === -1) {
       var returnTo = playerReturnFocus;
       playerReturnFocus = null;
-      stopPlayer(); pl.className = 'layer hidden';
+      // Hide FIRST. Engine.stop()/AVPlay destroy() can throw on Tizen 3.0;
+      // doing that before hiding is what left Back trapped inside the player.
+      pl.className = 'layer hidden';
       lastLayerClose = Date.now();
+      try { stopPlayer(); }
+      catch (e) { remoteLog('stop-error', { message: String((e && e.message) || e) }, true); }
       // Back from video returns to the exact page/control it was opened from
       // (e.g. the torrent list), with focus restored there.
       Focus.setRoot(U.qs('#app'));
@@ -578,7 +602,8 @@ var App = (function () {
   /* ---------------- player ---------------- */
   var player = null, currentStream = null, osdTimer = null, osdVisible = true;
   var playerData = null, seekEl = null, fillEl = null, playing = false;
-  var seekKeyupHandler = null, clearSeekTimer = null;
+  var seekKeyupHandler = null, clearSeekTimer = null, seekLoadTimer = null;
+  var firstLoadArmTimer = null, firstLoadFadeTimer = null;
   // Hardware keys are routed through these hooks so they always act on the
   // current player, even while the on-screen controller is hidden.
   var playerToggle = null, playerJump = null, playerStop = null, playerInfo = null;
@@ -594,8 +619,14 @@ var App = (function () {
   var nextEpisodeHooks = null;  // set by playUrl: pre-load of the next episode
   var cancelNextAutoplay = null; // set by playUrl; stops the Up-next countdown on exit
   var qrTimer = null, statsTimer = null, stallTimer = null, statsSlow = false;
+  var PAUSE_KEEP_MS = 15 * 60 * 1000;  // torrent engine stays alive this long while paused
+  var PAUSE_SOFT_MS = 45 * 1000;       // silent AVPlay reconnect after shorter pauses
+  var pauseStopHook = null;     // set by playUrl; cancels the 15-minute pause timer
   var clearPausedLogo = null;   // set by playUrl; removes pause scrim + title art
+  var hidePauseArtWithControls = null;  // set by playUrl; hides pause art with the OSD
   var focusReclaimTimer = null;
+  var playerClockTimer = null;  // repaints the local clock in the player OSD
+  var lastBackHandled = 0;      // Back is handled on keydown and keyup; fire once
   // Module-level so the global key handler can log errors even when the player
   // closure is not in scope. playUrl() replaces this with its logger on start.
   var remoteLog = function () {};
@@ -616,6 +647,27 @@ var App = (function () {
     var pp = U.qs('#pp', pl);
     if (pp) Focus.set(pp);
     remoteLog('focus-reclaim', { tag: active ? active.tagName : '', id: active ? active.id : '' });
+  }
+  // Local device time, HH:MM, shown in the top-right of the player controls
+  // only when Settings > Playback > Show clock is On.
+  function localClockText() {
+    var d = new Date(), h = d.getHours(), m = d.getMinutes();
+    return (h < 10 ? '0' : '') + h + ':' + (m < 10 ? '0' : '') + m;
+  }
+  function paintPlayerClock() {
+    var e = U.qs('#osd-clock');
+    if (!e) return;
+    var s = localClockText();
+    if (e.textContent !== s) e.textContent = s;
+  }
+  function startPlayerClock() {
+    stopPlayerClock();
+    if (U.get('showClock', true) === false) return;
+    paintPlayerClock();
+    playerClockTimer = setInterval(paintPlayerClock, 15000);
+  }
+  function stopPlayerClock() {
+    if (playerClockTimer) { clearInterval(playerClockTimer); playerClockTimer = null; }
   }
   function stopQrPolling() { if (qrTimer) { clearInterval(qrTimer); qrTimer = null; } }
   function stopStatsPolling() { if (statsTimer) { clearInterval(statsTimer); statsTimer = null; } statsSlow = false; }
@@ -717,6 +769,10 @@ var App = (function () {
       description: description,
       quality: info.quality || parsed.quality, seeders: info.seeders,
       infoHash: hash, fileIdx: fidx,
+      // Kept so an AVPlay recovery can restart the local engine with the same
+      // peers if the stream was stopped while the player was paused.
+      sources: (hash && sources) ? sources : [],
+      fileName: (hash && fname) || '',
       prevId: info.prevId || nav.prevId, nextId: nextId,
       nextTitle: info.nextTitle || nxi.title,
       preferAv: prefersAvPlay(s),
@@ -742,12 +798,38 @@ var App = (function () {
     if (n >= 1048576) return (n / 1048576).toFixed(1) + ' MB';
     return Math.round(n / 1024) + ' KB';
   }
+  // Number of distinct audio versions advertised by a torrent stream. The
+  // audio button is only useful when there are at least two; direct streams
+  // have no selectable tracks at all.
+  function audioVariantCount(s) {
+    if (!s || !API.infoHash(s)) return 0;
+    var hints = s.behaviorHints || {}, raw = '';
+    if (hints.audioLanguages) {
+      raw = Object.prototype.toString.call(hints.audioLanguages) === '[object Array]' ?
+        hints.audioLanguages.join(',') : String(hints.audioLanguages);
+    }
+    if (!raw) raw = API.parseStream(s).langs || '';
+    raw = String(raw || '');
+    var seen = [], i;
+    // Flag emoji (e.g. "🇬🇧 / 🇷🇺") are the usual Torrentio language format.
+    var flags = raw.match(/\uD83C[\uDDE6-\uDDFF]\uD83C[\uDDE6-\uDDFF]/g) || [];
+    for (i = 0; i < flags.length; i++) if (seen.indexOf(flags[i]) < 0) seen.push(flags[i]);
+    if (seen.length > 1) return seen.length;
+    // Otherwise count slash/comma separated names or codes.
+    var parts = raw.split(/[\/,+&|;]+/);
+    for (i = 0; i < parts.length; i++) {
+      var p = parts[i].replace(/^\s+|\s+$/g, '').replace(/[\uFE0F\u200D]/g, '');
+      if (p && seen.indexOf(p) < 0) seen.push(p);
+    }
+    return seen.length;
+  }
   // First-load only: the logo fills from left to right as the torrent buffers.
   // Stats from the LAN bridge sit below it; no title, status text or bar.
   function torrentLoaderHtml(opts) {
     var bg = opts.logo ? " style=\"background-image:url('" + U.attr(opts.logo) + "')\"" : '';
     var seeds = (opts.seeders === null || opts.seeders === undefined) ? '\u2014' : U.esc(opts.seeders);
-    return '<div class="torrent-loader" id="torrent-loader">' +
+    return '<div class="tl-curtain" id="tl-curtain"></div>' +
+      '<div class="torrent-loader" id="torrent-loader">' +
       '<div class="tl-logo" id="tl-logo"' + (opts.logo ? '' : ' style="display:none"') + '>' +
       '<div class="tl-logo-base" id="tl-logo-base"' + bg + '></div>' +
       '<div class="tl-logo-mask" id="tl-logo-mask"><div class="tl-logo-color" id="tl-logo-color"' + bg + '></div></div>' +
@@ -782,6 +864,7 @@ var App = (function () {
     // Cancel any long-pause art left by the previous playback before this
     // layer is rebuilt and the closure pointer is replaced.
     if (clearPausedLogo) { try { clearPausedLogo(); } catch (e) {} clearPausedLogo = null; }
+    hidePauseArtWithControls = null;
     subtitlePlaybackStarted = false;
     // The "Up next" card, its countdown and the auto-play all use the same
     // Settings value: N minutes before the end the card appears, counts down
@@ -825,7 +908,7 @@ var App = (function () {
     if (opts.seeders !== null && opts.seeders !== undefined)
       osdSub += (osdSub ? '  •  ' : '') + '\uD83D\uDC64 ' + U.esc(opts.seeders) + ' seeders';
     // Live download speed stays green, next to quality and seeders.
-    if (opts.infoHash) osdSub += (osdSub ? '  •  ' : '') + '\u2193 <b id="osd-speed">0 KB/s</b>';
+    if (opts.infoHash) osdSub += (osdSub ? '  •  ' : '') + '<b>\u2193</b> <b id="osd-speed">0 KB/s</b>';
     if (!osdSub) osdSub = U.esc(opts.type || '');
     var layer = U.qs('#player-layer');
     layer.className = 'layer'; clearLayer(layer);
@@ -836,17 +919,16 @@ var App = (function () {
       '<div class="paused-logo" id="paused-logo"' + (opts.logo ? " style=\"background-image:url('" + U.attr(opts.logo) + "')\"" : '') + '></div>' +
       '<div class="loading" id="load"></div><div class="load-pct" id="load-pct"></div>' +
       '<div class="player-osd" id="osd">' +
+      '<div class="osd-clock" id="osd-clock"></div>' +
       '<div class="osd-top"><div class="osd-title">' + U.esc(title || 'Playing') + '</div><div class="osd-sub">' + osdSub + '</div>' +
       '<div class="osd-desc">' + U.esc(opts.description || '') + '</div></div>' +
-      '<div class="osd-bottom"><div class="seekbar" id="seek" data-focus="1"><div class="fill" id="fill"></div><div class="knob" id="knob"></div></div>' +
+      '<div class="osd-bottom"><div class="seekbar" id="seek" data-focus="1"><div class="buffered" id="buffered"></div><div class="fill" id="fill"></div><div class="knob" id="knob"></div></div>' +
       '<div class="player-controls">' +
       '<span class="pbtn playpause" data-focus="1" data-icon="pause" id="pp"><i style="background-image:' + U.icon('pause') + '"></i></span>' +
       '<span class="pbtn" data-focus="1" data-icon="chevrons_back" id="prev-ep"><i style="background-image:' + U.icon('chevrons_back') + '"></i></span>' +
       '<span class="pbtn" data-focus="1" data-icon="chevrons_forward" id="next-ep-btn"><i style="background-image:' + U.icon('chevrons_forward') + '"></i></span>' +
       '<span class="pbtn" data-focus="1" data-icon="subtitles" id="subtitles"><i style="background-image:' + U.icon('subtitles') + '"></i></span>' +
       '<span class="pbtn" data-focus="1" data-icon="audio_tracks" id="audio"><i style="background-image:' + U.icon('audio_tracks') + '"></i></span>' +
-      '<span class="pbtn" data-focus="1" data-icon="audio" id="mute"><i style="background-image:' + U.icon('audio') + '"></i></span>' +
-      '<span class="pbtn" data-focus="1" data-icon="speed" id="speed"><i style="background-image:' + U.icon('speed') + '"></i></span>' +
       '<span class="time" id="time">0:00 / 0:00</span>' +
       '</div></div></div>' +
       '<div id="remote-focus" tabindex="-1" style="position:absolute;left:-100px;top:-100px;width:1px;height:1px;outline:none"></div>' +
@@ -857,23 +939,35 @@ var App = (function () {
       '<div class="ne-info"><div class="ne-kicker" id="next-ep-kicker">UP NEXT</div>' +
       '<div class="ne-title" id="next-ep-title">' + U.esc(opts.nextTitle || 'Next episode') + '</div>' +
       '<div class="ne-progress" id="next-ep-progress"></div></div>' +
-      '<div class="ne-action" id="next-ep-action" data-focus="1">▶ Next Episode</div>' +
+      '<div class="ne-action" id="next-ep-action" data-focus="1">Next Episode</div>' +
       '</div></div>';
+    startPlayerClock();
     Focus.setRoot(layer);
     // Pause-only treatment: a 20% black scrim, then the exact API title logo
     // from the loader at 100 px top/left. Both disappear on play/stop.
     var pausedLogo = U.qs('#paused-logo', layer);
     var pauseUnderlay = U.qs('#pause-underlay', layer);
-    function hidePauseArt() {
-      if (pausedLogo) pausedLogo.className = 'paused-logo';
+    function hidePauseArt(instant) {
+      // Controls disappear immediately; match them exactly when the pause art
+      // goes away on resume instead of fading out on its own timer.
+      if (pausedLogo) {
+        if (instant) pausedLogo.style.transition = 'none';
+        pausedLogo.className = 'paused-logo';
+      }
       if (pauseUnderlay) pauseUnderlay.className = 'pause-underlay';
     }
     function showPauseArt() {
       if (!player || !player.paused || !videoStarted) { hidePauseArt(); return; }
+      if (pausedLogo) pausedLogo.style.transition = '';
       if (pauseUnderlay) pauseUnderlay.className = 'pause-underlay show';
       if (pausedLogo) pausedLogo.className = 'paused-logo show';
     }
     clearPausedLogo = hidePauseArt;
+    pauseStopHook = clearPauseStop;
+    hidePauseArtWithControls = function () {
+      if (!player || player.paused) return;   // keep the art while still paused
+      hidePauseArt(true);
+    };
     // Movie Continue Watching items can arrive from the account library without
     // a logo. Fetch the real API meta.logo only in that case — never a poster
     // or backdrop — and paint both the loader and the pause art when it lands.
@@ -923,6 +1017,11 @@ var App = (function () {
     // Record every listener attached below, so they can be moved onto the
     // AVPlay player if the browser <video> cannot decode this stream.
     var playerListeners = [], usingAvPlay = false, lastStats = null, htmlVideo = player, srcSetAt = 0;
+    // Long pauses and AVPlay connection failures need a fresh local HTTP
+    // connection at the same position. Track when the pause started and how
+    // many automatic recoveries have already been attempted.
+    var pausedAt = 0, avRecoveries = 0;
+    var pauseStopTimer = null, pausedTooLong = false, resumeWarmup = null;
     function clampRate(r) { r = Number(r) || 1; return r < 0.25 ? 0.25 : (r > 2 ? 2 : r); }
     var playbackRate = clampRate(U.get('playbackRate', 1));
     var currentVolume = 1, currentMuted = false;
@@ -963,17 +1062,36 @@ var App = (function () {
       return true;
     }
     seekEl = U.qs('#seek', layer); fillEl = U.qs('#fill', layer);
+    var bufferedEl = U.qs('#buffered', layer);
     // Seeking is deferred: holding Left/Right only moves the seek cursor, and
     // the actual seek happens one second after the key is released. Repeated
     // keydowns used to fire a seek each time, which starved the torrent stream.
     var scrubbing = false, seekTarget = 0, scrubDir = 0, scrubHoldAt = 0, scrubTimer = null;
-    var wasPlayingBeforeScrub = false, lastScrubKeyAt = 0, seekHideTimer = null;
+    var wasPlayingBeforeScrub = false, lastScrubKeyAt = 0, seekHideTimer = null, scrubStart = 0;
+    // Light-purple segment: bytes that are already on the TV, so seeking into
+    // this range starts immediately. HTML video exposes it via buffered; the
+    // AVPlay plugin does not, so the NaCl engine reports loadedPct in /stats.
+    function paintBuffered() {
+      var d = player && player.duration, known = d && isFinite(d) && d > 0, pct = 0;
+      if (known && player.buffered && player.buffered.length) {
+        try { pct = player.buffered.end(player.buffered.length - 1) / d * 100; } catch (e) {}
+      }
+      if (!(pct > 0) && lastStats) {
+        if (lastStats.loadedPct != null) pct = Number(lastStats.loadedPct);
+        else if (lastStats.streamLen > 0 && lastStats.downloaded > 0)
+          pct = lastStats.downloaded * 100 / lastStats.streamLen;
+      }
+      if (!isFinite(pct) || pct < 0) pct = 0;
+      if (pct > 100) pct = 100;
+      bufferedEl.style.width = pct + '%';
+    }
     function paintSeek(t) {
       var d = player && player.duration, known = d && isFinite(d) && d > 0;
       var pct = known ? Math.max(0, Math.min(100, t / d * 100)) : 0;
       fillEl.style.width = pct + '%';
       U.qs('#knob', layer).style.left = pct + '%';
       U.qs('#time', layer).innerHTML = U.fmtTime(t) + ' / ' + (known ? U.fmtTime(d) : '--:--');
+      paintBuffered();
     }
     function commitSeek() {
       if (!scrubbing) return;
@@ -982,13 +1100,24 @@ var App = (function () {
       seekEl.className = seekEl.className.replace(/\s*scrubbing/g, '');
       if (!player || layer.className.indexOf('hidden') !== -1) return;
       // Seek commits immediately; no round overlay over a playing picture.
+      endWarmup();
       seekPending = true; seekFrom = -1;
       hideLoadSpinner();
-      try { player.currentTime = seekTarget; } catch (e) {}
-      // Resume immediately at the released position: the old 1 s delay made
-      // the picture look frozen after a long scrub.
-      if (wasPlayingBeforeScrub) { try { player.play(); } catch (e) {} }
-      remoteLog('seek', { target: seekTarget, duration: player.duration, at: player.currentTime });
+      // Backward seeks stay on the current AVPlay/HTTP range. Reopening the URL
+      // makes the local server answer with the whole file from byte 0, then the
+      // native seek lands on data that is not there and AVPlay reports
+      // "cannot decode the file". A straight seekTo keeps the live connection.
+      var backward = seekTarget < scrubStart - 0.5;
+      var reopened = false;
+      if (!backward && usingAvPlay) reopened = reopenPlayer(seekTarget, wasPlayingBeforeScrub);
+      if (!reopened) {
+        try { player.currentTime = seekTarget; } catch (e) {}
+        // Resume immediately at the released position: the old 1 s delay made
+        // the picture look frozen after a long scrub.
+        if (wasPlayingBeforeScrub && player.paused) { try { player.play(); } catch (e) {} }
+      }
+      remoteLog('seek', { target: seekTarget, duration: player.duration, at: player.currentTime,
+        backward: backward, reopened: reopened });
       showOsd();
     }
     clearSeekTimer = function () {
@@ -999,20 +1128,148 @@ var App = (function () {
     };
     var load = U.qs('#load', layer);
     var loader = U.qs('#torrent-loader', layer);
+    var curtain = U.qs('#tl-curtain', layer);
+    // First-load exit: black backdrop → transparent and logo/stats → 0 opacity
+    // together over exactly one second. Both elements carry the same CSS
+    // transition, so the picture is revealed under one continuous fade.
+    function fadeOutFirstLoad() {
+      if (!loader || loader.className.indexOf('hidden') !== -1) return;
+      firstLoadArmed = false;
+      firstLoadFading = true;
+      hideLoadSpinner();                                    // no circular loader over the fade
+      loader.className = 'torrent-loader hidden';           // logo + text: 0.5 s
+      if (curtain) curtain.className = 'tl-curtain hidden'; // black: 1 s
+      firstLoadFadeTimer = setTimeout(function () {
+        firstLoadFading = false; firstLoadFadeTimer = null;
+      }, 1000);
+    }
     // The small circular spinner belongs to the FIRST load only. Torrents use
     // the full-screen logo loader; after playback starts, nothing circular is
     // ever painted over the picture (seek, stall, next episode, etc.).
-    function hideLoadSpinner() { load.className = 'loading'; }
+    function hideLoadSpinner() {
+      load.className = 'loading';
+      updateLoadPct(0);   // never leave a stale 100% for the next spinner
+      if (seekLoadTimer) { clearTimeout(seekLoadTimer); seekLoadTimer = null; }
+    }
+
+    // The local server closes a paused AVPlay stream after its send timeout.
+    // Reopen the same URL on a fresh connection and restore the exact frame;
+    // this is what a manual replay used to do, without changing the UI.
+    function reopenPlayer(pos, resume) {
+      if (!player || !url) return false;
+      if (player.isAvPlay && player.reopen) { player.reopen(pos, resume); return true; }
+      try { player.src = url; player.load(); } catch (e) { return false; }
+      var apply = function () {
+        if (!player || layer.className.indexOf('hidden') !== -1) return;
+        try { player.currentTime = pos; } catch (e) {}
+        if (resume) { try { player.play(); } catch (e) {} }
+      };
+      player.addEventListener('loadedmetadata', apply);
+      setTimeout(apply, 400);
+      return true;
+    }
+    // The engine can stop while AVPlay is paused. Re-send the same torrent with
+    // its peer sources so the local HTTP server comes back before we reopen.
+    function rearmEngine() {
+      if (!opts.infoHash || !window.Engine || !Engine.start) return false;
+      try {
+        Engine.start(opts.infoHash, opts.fileIdx, opts.sources || [], opts.fileName || '');
+        return true;
+      } catch (e) { return false; }
+    }
+    function engineIsStarted() {
+      try { return !!(window.Engine && Engine.getInfo && Engine.getInfo().engineStarted); }
+      catch (e) { return false; }
+    }
+    // Android-style pause: keep the torrent/HTTP server alive for 15 minutes.
+    // Only after that do we stop the engine; pressing Play then needs a fresh
+    // head buffer and shows a spinner that only ever climbs to 100%.
+    function armPauseStop() {
+      if (!opts.infoHash) return;
+      if (pauseStopTimer) { clearTimeout(pauseStopTimer); pauseStopTimer = null; }
+      pauseStopTimer = setTimeout(function () {
+        pauseStopTimer = null;
+        if (!player || !player.paused || layer.className.indexOf('hidden') !== -1) return;
+        pausedTooLong = true;
+        lastStats = null;
+        try { if (window.Engine && Engine.stop) Engine.stop(); } catch (e) {}
+        remoteLog('pause-stop', { afterMs: pausedAt ? Date.now() - pausedAt : 0 }, true);
+      }, PAUSE_KEEP_MS);
+    }
+    function clearPauseStop() {
+      if (pauseStopTimer) { clearTimeout(pauseStopTimer); pauseStopTimer = null; }
+    }
+    function beginResumeWarmup(pos) {
+      var wasStarted = engineIsStarted();
+      // Android-style restart: the fresh engine starts its counter at zero.
+      // From here on updateResumeWarmup() only ever increases the number.
+      resumeWarmup = { pos: pos, pct: 0, started: false };
+      remoteLog('resume-pct', { pct: 0, engineWasOn: wasStarted }, true);
+      beginWarmup(180000);          // spinner up while the fresh head buffer arrives
+      showBufferLoad(true);
+      updateLoadPct(resumeWarmup.pct);
+      rearmEngine();
+      remoteLog('resume-warm', { pos: pos, pauseMs: pausedAt ? Date.now() - pausedAt : 0,
+        engineWasOn: wasStarted }, true);
+    }
+    // Called from the stats poll while the post-15-minute spinner is up. Every
+    // value is clamped to the previous one, so the number never falls back.
+    function updateResumeWarmup(d) {
+      if (!resumeWarmup || !d) return;
+      var target = (d.streamLen && isFinite(d.streamLen) && d.streamLen > 0) ?
+        Math.min(START_BYTES, d.streamLen) : START_BYTES;
+      var bytes = Math.max(d.downloaded || 0, Math.min((d.blocksRx || 0) * 16384, target));
+      var pct = bytes / target * 100;
+      if (!isFinite(pct) || pct < 0) pct = 0;
+      if (pct > 100) pct = 100;
+      if (pct < resumeWarmup.pct) pct = resumeWarmup.pct;
+      resumeWarmup.pct = pct;
+      updateLoadPct(pct);
+      if (pct < 100 || resumeWarmup.started) return;
+      resumeWarmup.started = true;
+      var at = resumeWarmup.pos;
+      resumeWarmup = null;
+      remoteLog('resume-ready', { pos: at, bytes: bytes, target: target }, true);
+      endWarmup();
+      hideLoadSpinner();
+      if (usingAvPlay) reopenPlayer(at, true);
+      else {
+        try {
+          player.src = url; player.load();
+          player.currentTime = at; player.play();
+        } catch (e) {}
+      }
+      setPpIcon('pause');
+      showOsd();
+    }
 
     // One entry point for the hardware Play/Pause key and the on-screen button.
     // Never leave a half-finished scrub behind when toggling playback.
     function togglePlayback() {
       if (!player || layer.className.indexOf('hidden') !== -1) return;
       if (scrubbing) commitSeek();
-      var wasPaused = !!player.paused;
-      if (wasPaused) { try { player.play(); } catch (e) {} setPpIcon('pause'); hidePauseArt(); }
-      else { try { player.pause(); } catch (e) {} setPpIcon('play'); showPauseArt(); }
-      remoteLog('toggle', { from: wasPaused ? 'paused' : 'playing', av: !!usingAvPlay });
+      var wasPaused = !!player.paused, pos = player.currentTime || 0;
+      if (wasPaused) {
+        clearPauseStop();   // the user came back before/within the 15-minute window
+        var pausedMs = pausedAt ? Date.now() - pausedAt : 0;
+        if (opts.infoHash && (pausedTooLong || pausedMs >= PAUSE_KEEP_MS)) {
+          // Engine was stopped after 15 minutes: warm a fresh head buffer with
+          // a monotonic 0→100% spinner, then resume automatically.
+          beginResumeWarmup(pos);
+        } else if (usingAvPlay && pausedMs >= PAUSE_SOFT_MS) {
+          // Within the 15-minute window: engine and pieces are still alive.
+          // Reopen the dead AVPlay range request silently so Play lands in film.
+          reopenPlayer(pos, true);
+        } else { try { player.play(); } catch (e) {} }
+        setPpIcon('pause');   // pause art goes when the controls hide, together
+      } else {
+        try { player.pause(); } catch (e) {}
+        armPauseStop();   // keep the torrent/HTTP server alive for 15 minutes
+        setPpIcon('play'); showPauseArt();
+      }
+      remoteLog('toggle', { from: wasPaused ? 'paused' : 'playing', av: !!usingAvPlay,
+        pausedMs: wasPaused ? (pausedAt ? Date.now() - pausedAt : 0) : 0,
+        warm: !!(wasPaused && resumeWarmup) });
       showOsd();
     }
     // Left/Right with the controller hidden: real -10/+10 s jump, not just a
@@ -1023,12 +1280,21 @@ var App = (function () {
       var d = player.duration, t = (player.currentTime || 0) + sec;
       if (t < 0) t = 0;
       if (d && isFinite(d) && d > 0 && t > d) t = d;
+      endWarmup();
       seekPending = true; seekFrom = -1;
       hideLoadSpinner();
-      try { player.currentTime = t; } catch (e) {}
-      if (player.paused) { try { player.play(); } catch (e) {} }
+      // Rewinding only needs a native seekTo inside the range already open on
+      // the local server. Reopening restarted the file at byte 0 and produced
+      // AVPlay decode errors after the wait.
+      var backward = sec < 0, reopened = false;
+      if (!backward && usingAvPlay) reopened = reopenPlayer(t, true);
+      if (!reopened) {
+        try { player.currentTime = t; } catch (e) {}
+        if (player.paused) { try { player.play(); } catch (e) {} }
+      }
       setPpIcon('pause');
-      remoteLog('jump', { sec: sec, target: t, paused: player.paused });
+      remoteLog('jump', { sec: sec, target: t, paused: player.paused,
+        backward: backward, reopened: reopened });
       showOsd();
     }
     // ---- YouTube-TV style extras -----------------------------------------
@@ -1117,9 +1383,11 @@ var App = (function () {
     // with these bytes, so every MB downloaded visibly advances it.
     var START_BYTES = 16 * 1048576;
     var tlPct = 0, firstPlay = true, videoStarted = !opts.infoHash;
+    var firstLoadArmed = false, firstLoadFading = false, fadeFromTime = 0;
     // Direct streams: small spinner only until the first frame. Torrents: the
     // logo loader is the only loading UI, so the spinner stays hidden.
-    if (loader) hideLoadSpinner(); else load.className = 'loading show';
+    if (loader) hideLoadSpinner();
+    else { load.className = 'loading show'; updateLoadPct(0); }
 
     function setLoaderPct(pct) {
       if (!loader) return;
@@ -1134,6 +1402,50 @@ var App = (function () {
           return player.buffered.end(player.buffered.length - 1) / player.duration * 100;
       } catch (e) {}
       return 0;
+    }
+    // Percentage shown inside the circular loader while the picture is waiting.
+    // Torrent playback uses the engine's buffer-at-current-position value;
+    // direct streams fall back to the browser's buffered range.
+    function updateLoadPct(pct) {
+      var el = U.qs('#load-pct', layer);
+      if (!el) return;
+      pct = Number(pct);
+      if (!isFinite(pct)) pct = bufferedPct();
+      pct = Math.max(0, Math.min(100, Math.round(pct)));
+      if (resumeWarmup && pct < resumeWarmup.pct) pct = resumeWarmup.pct;
+      setHtml(el, pct + '%');
+    }
+    function showBufferLoad(force) {
+      if (!player || layer.className.indexOf('hidden') !== -1) return;
+      if (firstLoadFading && !force) return;   // fade straight into the picture, no spinner
+      if (!videoStarted || (player.paused && !force)) return;   // first-load art owns the screen
+      if (loader && loader.className.indexOf('hidden') === -1) return;
+      load.className = 'loading show';
+      updateLoadPct(0);   // always start at 0 while spinning; real stats arrive next
+    }
+    // Resuming after a long pause needs a fresh local connection, and the
+    // engine may need tens of seconds to assemble the pieces at that position.
+    // Keep the circular loader up for that whole window and never let the
+    // stall watchdog seek/close the connection while it is warming up: that
+    // seek is what turns a slow refill into AVPlay CONNECTION_FAILED.
+    var warmupUntil = 0;
+    function beginWarmup(ms) {
+      warmupUntil = Date.now() + (ms || 30000);
+      showBufferLoad(true);
+      updateLoadPct(0);   // the pre-pause 100% is stale; wait for fresh stats
+    }
+    function warmingUp() { return Date.now() < warmupUntil; }
+    function endWarmup() { warmupUntil = 0; }
+    // A seek can buffer without AVPlay raising 'waiting'. If the picture has
+    // not moved on shortly after the seek, show the same circular loader.
+    function armSeekBufferLoad() {
+      if (seekLoadTimer) { clearTimeout(seekLoadTimer); seekLoadTimer = null; }
+      if (!videoStarted) return;
+      seekLoadTimer = setTimeout(function () {
+        seekLoadTimer = null;
+        if (!seekPending || !player || player.paused) return;
+        showBufferLoad();
+      }, 150);
     }
     // TEMP: ship live engine diagnostics to the development PC so no one has
     // to read numbers off the TV screen.
@@ -1171,10 +1483,14 @@ var App = (function () {
         statsInFlight = false;
         if (!d || layer.className.indexOf('hidden') !== -1) return;
         lastStats = d;
+        paintBuffered();   // light-purple ready range on the seek bar
         // Inside the round loader (seek / buffering): how much of the data
-        // needed at the current spot has arrived.
-        setHtml(U.qs('#load-pct', layer),
-          Math.max(0, Math.min(100, Math.round(Number(d.bufPct) || 0))) + '%');
+        // needed at the current spot has arrived. Never prefill the hidden
+        // loader, or it opens on a stale 100% from the first-load buffer.
+        if (load.className.indexOf('show') !== -1) {
+          if (resumeWarmup) updateResumeWarmup(d);   // monotonic fresh-buffer fill
+          else updateLoadPct(d.bufPct);
+        }
         var spd = fmtRate(d.downloadSpeed);
         setHtml(U.qs('#tl-speed', layer), spd);
         setHtml(U.qs('#osd-speed', layer), spd);   // top OSD, next to seeders
@@ -1255,6 +1571,14 @@ var App = (function () {
       }
       if (loader && loader.className.indexOf('hidden') === -1) return;
       var t = player.currentTime || 0;
+      if (warmingUp()) {
+        // A reopened stream can stall for a long time while the engine fetches
+        // the new range. A backward seek here closes that HTTP connection and
+        // AVPlay then fails with CONNECTION_FAILED. Just keep the loader up.
+        showBufferLoad(true);
+        lastProgressTime = t; lastProgressAt = Date.now();
+        return;
+      }
       if (t > lastProgressTime + 0.2) {
         lastProgressTime = t; lastProgressAt = Date.now(); stallKicks = 0;
         return;
@@ -1266,7 +1590,9 @@ var App = (function () {
         // Repeated stalls: reload the same on-TV stream at the last position.
         stallRecoveries++; stallKicks = 0;
         opts.resumePos = t; resumeDone = false;
-        try { player.src = url; player.load(); player.play(); } catch (e) {}
+        if (!reopenPlayer(t, true)) {
+          try { player.src = url; player.load(); player.play(); } catch (e) {}
+        }
         setTimeout(function () { reclaimRemoteFocus(true); }, 0);
       } else if (stallKicks <= 2) {
         // First two stalls: a small backward seek re-kicks the decoder/pipeline.
@@ -1279,19 +1605,34 @@ var App = (function () {
     // Poll fast (4x/second) so the logo creeps forward as each chunk arrives.
     if (loader) { pollStats(); statsTimer = setInterval(pollStats, 250); }
     player.addEventListener('progress', function () {
+      if (load.className.indexOf('show') !== -1 && !resumeWarmup)
+        updateLoadPct(lastStats && lastStats.bufPct != null ? lastStats.bufPct : bufferedPct());
       if (!statsTimer) setLoaderPct(bufferedPct());   // fallback when bridge is down
     });
     player.addEventListener('playing', function () {
       subtitlePlaybackStarted = true;
+      clearPauseStop();
+      pausedTooLong = false;
+      pausedAt = 0; avRecoveries = 0;
+      // AVPlay emits 'playing' as soon as play() is requested, which can be
+      // long before the reopened range has any data. Never clear seekPending
+      // here: the loader must stay up until the clock actually moves (handled
+      // in timeupdate), otherwise a backward seek shows a bare black screen.
+      setPpIcon('pause');   // the native player may have corrected the state
       updateSubtitle();
       hidePauseArt();       // pause art is never shown over a playing picture
-      hideLoadSpinner();   // spinner is first-load only, never over the picture
+      if (!seekPending && !warmingUp()) hideLoadSpinner();   // wait for real frames
       if (loader) {
         firstPlay = false;
-        // Keep polling: the green download speed stays live during playback.
-        setTimeout(function () {
-          if (layer.className.indexOf('hidden') === -1) loader.className = 'torrent-loader hidden';
-        }, 450);
+        // AVPlay raises 'playing' as soon as play() is requested, often before
+        // the first real frame. Arm the fade and commit it when the clock
+        // actually advances; the timer is the fallback without a timeupdate.
+        firstLoadArmed = true; fadeFromTime = 0;
+        if (firstLoadArmTimer) { clearTimeout(firstLoadArmTimer); firstLoadArmTimer = null; }
+        firstLoadArmTimer = setTimeout(function () {
+          firstLoadArmTimer = null;
+          if (firstLoadArmed) fadeOutFirstLoad();
+        }, 400);
       }
       playing = true;
       // The fast 250 ms poll is only needed while the logo loads. Once the
@@ -1303,29 +1644,44 @@ var App = (function () {
       resetOsd();
     });
     player.addEventListener('waiting', function () {
-      // Never bring the circular spinner back once the picture is up. The
-      // first-load logo/direct spinner already covered the initial wait.
-      hideLoadSpinner();
+      // The picture ran dry after playback started: bring back the circular
+      // loader with the buffer percentage inside it.
+      showBufferLoad();
     });
     player.addEventListener('pause', function () {
+      pausedAt = Date.now();
+      resumeWarmup = null;
+      pausedTooLong = false;
+      armPauseStop();
+      endWarmup();
+      seekPending = false;
+      setPpIcon('play');
+      hideLoadSpinner();   // pause art, not a buffering spinner
       showPauseArt();
       updateSubtitle();   // pause art replaces the subtitle line immediately
       showOsd();   // controls stay on screen for as long as the video is paused
     });
     // Skipping forward jumps to a position the player has not fetched yet.
     // Show the spinner and keep it up until data at the new spot is ready.
-    var seekPending = false, seekFrom = 0;
+    var seekPending = false, seekFrom = 0, lastBufferLoadAt = 0;
     function hideSeekLoad() {
       if (!seekPending) return;
       seekPending = false;
+      endWarmup();
       hideLoadSpinner();
     }
     player.addEventListener('seeking', function () {
       if (firstPlay) return;
       seekPending = true; seekFrom = -1;
-      hideLoadSpinner();
-      // Keep the pending-seek guard until the new spot actually advances; no
-      // visual spinner is painted over the movie while that happens.
+      // A long-pause reopen performs its own seek internally. Its spinner is
+      // already up and must stay up until this new range really advances.
+      if (!warmingUp()) {
+        hideLoadSpinner();
+        // Keep the pending-seek guard until the new spot actually advances. If
+        // the seek turns into a real buffer stall, 'waiting' brings the circular
+        // loader back with its percentage.
+        armSeekBufferLoad();
+      }
       if (seekHideTimer) clearTimeout(seekHideTimer);
       seekHideTimer = setTimeout(function () { seekHideTimer = null; hideSeekLoad(); }, 45000);
     });
@@ -1337,6 +1693,24 @@ var App = (function () {
     // (Players land on the nearest keyframe, so compare with the first position
     // reported after the jump, not with the requested target.)
     player.addEventListener('timeupdate', function () {
+      if (firstLoadArmed && player && !player.paused && playing) {
+        var nowT = player.currentTime || 0;
+        if (!fadeFromTime) fadeFromTime = nowT;
+        else if (nowT - fadeFromTime >= 0.1) fadeOutFirstLoad();
+      }
+      if (load.className.indexOf('show') !== -1) {
+        if (resumeWarmup) updateResumeWarmup(lastStats);
+        else updateLoadPct(lastStats && lastStats.bufPct != null ? lastStats.bufPct : bufferedPct());
+        // The picture is actually advancing again: drop the buffering spinner
+        // even if AVPlay never raised 'playing' after the stall. Never do this
+        // mid post-pause warmup: the 100% value owns that spinner.
+        if (!resumeWarmup && !seekPending && player && !player.paused &&
+            player.currentTime - lastBufferLoadAt >= 1) {
+          endWarmup();          // at least a second of real frames: refill done
+          hideLoadSpinner();
+        }
+      }
+      lastBufferLoadAt = player ? (player.currentTime || 0) : 0;
       if (!seekPending || !player) return;
       var t = player.currentTime || 0;
       if (seekFrom < 0 || t < seekFrom) seekFrom = t;   // lowest position since the jump
@@ -1351,12 +1725,38 @@ var App = (function () {
       remoteLog('playerror', { code: err.code || 0, message: err.message || '',
         usingAvPlay: usingAvPlay, preferAv: !!opts.preferAv,
         diag: window.AvPlayer && AvPlayer.diag ? AvPlayer.diag() : null,
-        ready: lastStats && lastStats.ready, streamLen: lastStats && lastStats.streamLen });
+        ready: lastStats && lastStats.ready, streamLen: lastStats && lastStats.streamLen }, true);
       // The browser <video> could not decode this file: hand the same on-TV
       // URL to Samsung's native AVPlay pipeline (MKV, HEVC, AC3, ...).
       if (player === htmlVideo && switchToAvPlay()) return;
+      // AVPlay code 4 after a long pause or a seek is a dead local HTTP
+      // connection, not a decode failure. Recover at the same frame instead
+      // of making the user replay the stream. Never do this during the first
+      // load, where code 4 can be a real unsupported-format error.
+      if (usingAvPlay && videoStarted && !firstPlay &&
+          ((err.code || 0) === 4 || /CONNECTION_FAILED/i.test(err.message || '')) && avRecoveries < 2) {
+        avRecoveries++;
+        var at = player.currentTime || 0, resume = !player.paused;
+        // Never leave a black frame after the error: the loader stays up while
+        // a fresh connection is made and the range is assembled again.
+        beginWarmup(30000);
+        var engineOn = true;
+        try { if (window.Engine && Engine.getInfo) engineOn = !!Engine.getInfo().engineStarted; } catch (e) {}
+        // If the engine stopped while paused, restart it and give its HTTP
+        // server time to bind before asking AVPlay to open the stream again.
+        if (!engineOn) rearmEngine();
+        remoteLog('av-recover', { attempt: avRecoveries, at: at, resume: resume,
+          rearm: !engineOn, bufPct: lastStats && lastStats.bufPct }, true);
+        setTimeout(function () {
+          if (!player || layer.className.indexOf('hidden') !== -1) return;
+          showBufferLoad(true);
+          if (reopenPlayer(at, resume)) reclaimRemoteFocus(true);
+        }, engineOn ? 800 : 1200);
+        return;
+      }
       load.className = 'loading';
-      if (loader) { loader.className = 'torrent-loader hidden'; stopStatsPolling(); }
+      updateLoadPct(0);
+      if (loader) { fadeOutFirstLoad(); stopStatsPolling(); }
       toast(playErrorText(err, lastStats, usingAvPlay));
     });
     // A video that reaches the end is always watched, even when the final
@@ -1375,6 +1775,7 @@ var App = (function () {
       if (!scrubbing) {
         var pct = player.currentTime / player.duration * 100;
         fillEl.style.width = pct + '%';
+        paintBuffered();
         U.qs('#knob', layer).style.left = pct + '%';
         // One text node change per second, not per frame: repeated innerHTML
         // writes were enough to make the old TV's UI stop answering the remote.
@@ -1482,7 +1883,9 @@ var App = (function () {
         remoteLog('premature-end', { t: t, d: d, attempt: endRecoveries });
         opts.resumePos = t; resumeDone = false;
         var wasPaused = player.paused;
-        try { player.src = url; player.load(); if (!wasPaused) player.play(); } catch (e) {}
+        if (!reopenPlayer(t, !wasPaused)) {
+          try { player.src = url; player.load(); if (!wasPaused) player.play(); } catch (e) {}
+        }
         setTimeout(function () { reclaimRemoteFocus(true); }, 0);
         return;
       }
@@ -1577,9 +1980,13 @@ var App = (function () {
       playerMenu('Subtitles', rows, replace);
     }
     U.qs('#subtitles', layer).onclick = function () { openSubtitleMenu(); };
-    U.qs('#audio', layer).onclick = function () { playerMenu('Audio', [{ label: 'Default', fn: function () {} }]); };
-    U.qs('#mute', layer).onclick = toggleMute;
-    U.qs('#speed', layer).onclick = openSpeedMenu;
+    var audioBtn = U.qs('#audio', layer);
+    var showAudioBtn = audioVariantCount(currentStream) > 1;
+    if (audioBtn && showAudioBtn) {
+      audioBtn.onclick = function () { playerMenu('Audio', [{ label: 'Default', fn: function () {} }]); };
+    } else if (audioBtn && audioBtn.parentNode) {
+      audioBtn.parentNode.removeChild(audioBtn);
+    }
     function gotoEpisode(id, dir) {
       if (!id) { toast(dir === 'prev' ? 'No previous episode' : 'No next episode'); return; }
       remoteLog('episodenav', { dir: dir, id: id });
@@ -1635,8 +2042,9 @@ var App = (function () {
         if (!s) { gotoEpisode(id, dir); return; }    // no source: only then show the list
         var meta = playerData || {}, v = null, vs = meta.videos || [];
         for (var i = 0; i < vs.length; i++) if (vs[i].id === id) v = vs[i];
-        var epName = v ? (v.title || v.name) : '';
-        var title = (meta.name || '') + (v ? ' \u2014 S' + v.season + ' E' + v.episode + (epName ? '  \u2022  ' + epName : '') : '');
+        // Same title format as the stream list and Continue Watching.
+        var title = Views.displayTitle ? Views.displayTitle(meta, id) :
+          ((meta.name || '') + (v ? ' \u2014 S' + v.season + ' E' + v.episode : ''));
         var sameTorrent = !!opts.infoHash && API.infoHash(s) === opts.infoHash;
         remoteLog('episodenav', { dir: dir + '-direct', id: id, sameTorrent: sameTorrent });
         stopPlayer(sameTorrent);
@@ -1664,10 +2072,21 @@ var App = (function () {
     //   LEFT/RIGHT with controls hidden -> jump -10/+10 s and resume
     //   LEFT/RIGHT on a button -> walk the button row
     //   LEFT/RIGHT on the seek bar -> scrub; the longer you hold, the faster
-    //   UP/DOWN -> cycle through all controls (incl. seek bar)
+    //   UP      -> from a button: seek bar; from seek bar: Next Episode or close
+    //   DOWN    -> control row (Play/Pause from the seek bar)
     //   OK      -> activate the focused control
-    var btnOrder = ['pp', 'prev-ep', 'next-ep-btn', 'subtitles', 'audio', 'mute', 'speed'];
+    var btnOrder = ['pp', 'prev-ep', 'next-ep-btn', 'subtitles'];
+    if (showAudioBtn) btnOrder.push('audio');
     var ctrlOrder = ['seek'].concat(btnOrder).concat(['next-ep-action']);
+    // Up from a control button parks on the seek bar; Down returns to the
+    // button the user came from instead of always jumping to Play/Pause.
+    var lastControlFocus = null;
+    function isControlButton(el) {
+      if (!el || !el.id) return false;
+      if (el.id === 'next-ep-action') return true;
+      for (var i = 0; i < btnOrder.length; i++) if (btnOrder[i] === el.id) return true;
+      return false;
+    }
     function moveHorizontal(dir) {
       var f = Focus.get(), idx = -1, i;
       for (i = 0; i < btnOrder.length; i++) if (f && f.id === btnOrder[i]) idx = i;
@@ -1696,6 +2115,7 @@ var App = (function () {
       if (!scrubbing) {
         scrubbing = true;
         seekTarget = (player && player.currentTime) || 0;
+        scrubStart = seekTarget;
         wasPlayingBeforeScrub = !!(player && !player.paused);
         scrubHoldAt = Date.now();
       }
@@ -1772,12 +2192,24 @@ var App = (function () {
         if (k === 40) {
           // Down always brings up the control row, Next Episode showing or not.
           showOsd();
-          if (onSeek) Focus.set(U.qs('#pp', layer));
+          if (onSeek) {
+            // Return to the button that was focused before going Up.
+            var back = (lastControlFocus && layer.contains(lastControlFocus) &&
+              lastControlFocus.offsetParent !== null) ? lastControlFocus : U.qs('#pp', layer);
+            if (back) Focus.set(back);
+          }
           return true;
         }
-        // With the Next Episode prompt on screen, Up from the seek bar goes
-        // straight back to its action button (and hides the controls again).
-        if (nextShowing && onSeek) {
+        // Up from any control button lands on the seek bar, like Android TV.
+        if (!onSeek) {
+          if (isControlButton(cf)) lastControlFocus = cf;
+          Focus.set(seekEl);
+          showOsd();
+          return true;
+        }
+        // Up from the seek bar goes to the Next Episode action when it is on
+        // screen; otherwise it closes the controller.
+        if (nextShowing && na) {
           Focus.set(na); hideOsd(); return true;
         }
         hideOsd();
@@ -1960,6 +2392,12 @@ var App = (function () {
   function hideOsd() {
     var osd = U.qs('#osd');
     if (osd) osd.style.opacity = '0';
+    // Pause art leaves with the controller, not earlier on Play. The hook
+    // ignores calls while still paused, so paused artwork stays until resume.
+    if (hidePauseArtWithControls) { try { hidePauseArtWithControls(); } catch (e) {} }
+    // A focused control must not keep the controller alive. Drop focus when
+    // the timer expires (or Up hides it) so OK goes back to Play/Pause.
+    if (osd && osd.contains && Focus.get() && osd.contains(Focus.get())) Focus.clear();
     if (osdTimer) { clearTimeout(osdTimer); osdTimer = null; }
     positionNextEp(false);
   }
@@ -2004,9 +2442,15 @@ var App = (function () {
     // Store the final position before tearing down (Continue Watching).
     if (saveProgressNow) { try { saveProgressNow(); } catch (e) {} saveProgressNow = null; }
     if (clearSeekTimer) { clearSeekTimer(); clearSeekTimer = null; }
+    if (seekLoadTimer) { clearTimeout(seekLoadTimer); seekLoadTimer = null; }
+    if (firstLoadArmTimer) { clearTimeout(firstLoadArmTimer); firstLoadArmTimer = null; }
+    if (firstLoadFadeTimer) { clearTimeout(firstLoadFadeTimer); firstLoadFadeTimer = null; }
     if (seekKeyupHandler) { document.removeEventListener('keyup', seekKeyupHandler, false); seekKeyupHandler = null; }
     if (osdTimer) { clearTimeout(osdTimer); osdTimer = null; }
+    if (pauseStopHook) { try { pauseStopHook(); } catch (e) {} pauseStopHook = null; }
+    stopPlayerClock();
     if (clearPausedLogo) { try { clearPausedLogo(); } catch (e) {} clearPausedLogo = null; }
+    hidePauseArtWithControls = null;
     subtitlePlaybackStarted = false;
     Focus.onKey(null);
     playerToggle = null; playerJump = null; playerStop = null; playerInfo = null;
@@ -2015,10 +2459,12 @@ var App = (function () {
     playerMenuTitle = ''; playerMenuRows = null; playerMenuFocus = 0; playerMenuRenderId++;
     stopStatsPolling();
     stopStallWatch();
-    remoteLog = function () {};
     // Going straight to the next episode keeps the engine (peers, metadata and
     // the pre-loaded pieces); playStream() then switches its file.
-    if (window.Engine && !keepEngine) window.Engine.stop();
+    if (window.Engine && !keepEngine) {
+      try { window.Engine.stop(); }
+      catch (e) { remoteLog('engine-stop-error', { message: String((e && e.message) || e) }, true); }
+    }
     var p = player;
     player = null;   // first, so late 'error' events from the old player are ignored
     if (p) {
@@ -2027,6 +2473,7 @@ var App = (function () {
     }
     document.documentElement.className = document.documentElement.className.replace(/\s*avplay-active/g, '');
     document.body.className = document.body.className.replace(/\s*avplay-active/g, '');
+    remoteLog = function () {};
   }
 
   function init() {
@@ -2052,6 +2499,9 @@ var App = (function () {
       if (!player) return;
       var k = e.keyCode, handled = false;
       if (k === 415 || k === 19 || k === 179) {
+        // AVPlay can hold native focus just for the media keys. Pull it back
+        // before acting so Play/Pause is never swallowed by the plugin.
+        reclaimRemoteFocus(true);
         if (!e.repeat && playerToggle) { try { playerToggle(); } catch (err) { remoteLog('toggle-error', { message: String(err && err.message || err) }); } }
         handled = !!playerToggle;
       } else if (k === 412 && playerJump) { try { playerJump(-30); } catch (err) {} handled = true; }
@@ -2067,15 +2517,21 @@ var App = (function () {
       }
       // Back is handled in the capture phase so the player can always be
       // exited even if focus has landed on the AVPlay plugin or a hidden control.
-      else if (isBackKey(k) && !e.repeat) {
-        var pmenu = U.qs('#pmenu');
-        if (pmenu && pmenu.className.indexOf('open') !== -1) closePlayerMenu();
-        else closeLayers();
+      else if (isBackKey(k)) {
+        handlePlayerBack(k);
         handled = true;
       } else if (k === 13 && playerOk && playerOk(k, e)) {
         handled = true;
       }
       if (handled) { e.preventDefault(); e.stopPropagation(); }
+    }, true);
+    // Some Tizen firmware sends Back only on keyup while AVPlay owns focus.
+    // The debounce handlePlayerBack() uses makes this a safe fallback.
+    document.addEventListener('keyup', function (e) {
+      if (isBackKey(e.keyCode)) {
+        handlePlayerBack(e.keyCode);
+        e.preventDefault(); e.stopPropagation();
+      }
     }, true);
     // Re-check every 2 s: if AVPlay or the NaCl embed takes native focus,
     // keydown never reaches the document and the TV looks completely frozen.

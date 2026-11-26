@@ -1976,6 +1976,7 @@ std::string statsJson() {
   // % of the next 4 MB at the playing spot that has arrived (whole pieces +
   // blocks of the piece being assembled): shown inside the player's loader.
   int bufPct = 0;
+  int loadedPct = 0;
   if (g_metaReady && g_pieceLength) {
     const uint64_t target = 4ull * 1048576;
     uint64_t want = g_wantOffset, have = cachedFrom(want, target);
@@ -1988,6 +1989,17 @@ std::string statsJson() {
       if (have > target) have = target;
     }
     bufPct = (int)(have * 100 / target);
+    // How much of this file has been downloaded, capped at 100% so repeated
+    // downloads after a seek cannot push the bar past the end. This is the
+    // light-purple part of the seek bar; contiguous-from-start fell back to 0
+    // as soon as the cache window moved past the beginning of the file.
+    if (g_fileEnd > g_fileStart) {
+      uint64_t fileLen = g_fileEnd - g_fileStart;
+      uint64_t bytes = g_downloaded;
+      if (bytes > fileLen) bytes = fileLen;
+      loadedPct = (int)(bytes * 100 / fileLen);
+      if (loadedPct > 100) loadedPct = 100;
+    }
   }
   int haveCount = 0, interestedCount = 0, unchokedCount = 0, outstandingCount = 0;
   pthread_mutex_lock(&g_lock);
@@ -2042,7 +2054,8 @@ std::string statsJson() {
     << ",\"trackers\":" << g_trackers.size() << ",\"trackerPeers\":" << g_trackerPeers
     << ",\"dhtNodes\":" << g_dhtNodes << ",\"dhtQueries\":" << g_dhtQueries
     << ",\"dhtResponses\":" << g_dhtResponses << ",\"dhtPeers\":" << g_dhtPeers
-    << ",\"bufPct\":" << bufPct << ",\"prefetchIdx\":" << g_prefetchIdx << ",\"fileIdx\":" << g_fileIdx
+    << ",\"bufPct\":" << bufPct << ",\"loadedPct\":" << loadedPct
+    << ",\"prefetchIdx\":" << g_prefetchIdx << ",\"fileIdx\":" << g_fileIdx
     << ",\"plog\":[";
   pthread_mutex_lock(&g_lock);
   for (size_t i = 0; i < g_attemptLog.size(); i++) {

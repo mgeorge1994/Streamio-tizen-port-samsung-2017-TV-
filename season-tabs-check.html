@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><link rel="stylesheet" href="app-native/css/style.css">
+<style>html,body{margin:0;width:1920px;height:1080px;overflow:hidden}body{zoom:.5}
+.ep-grid{background:rgba(255,0,0,.45);outline:2px solid #f00}
+.season-tabs-viewport{background:rgba(0,0,255,.45);outline:2px solid #00f}
+</style></head>
+<body>
+<div id="view"><div class="page meta-page"><div class="md-content">
+  <div id="md-body" style="width:1690px">
+    <div class="season-tabs-viewport" id="viewport"><div class="season-tabs" id="tabs"></div></div>
+    <div class="md-scroll" id="scroll" style="height:600px"><div class="ep-grid" id="grid"></div></div>
+  </div>
+</div></div></div>
+<script src="app-native/js/focus.js"></script>
+<script>
+var U = { set: function () {}, qs: function () { return null; }, esc: function (s) { return s; } };
+(function(){
+  var vp=document.getElementById('viewport'), tabs=document.getElementById('tabs'),
+      sc=document.getElementById('scroll'), grid=document.getElementById('grid');
+  for(var i=1;i<=25;i++){var e=document.createElement('div');e.className='st-tab'+(i===20?' active':'');e.textContent='Season '+i;tabs.appendChild(e);}
+  for(var j=0;j<6;j++){var c=document.createElement('div');c.className='ep-card';c.setAttribute('data-focus','1');c.setAttribute('data-vid','ep'+(j+1));c.innerHTML='<div class="ep-thumb"><span class="ep-num">E'+(j+1)+'</span></div><div class="ep-name">Episode '+(j+1)+'</div>';grid.appendChild(c);}
+  function rows(list){var out=[],last=null;for(var i=0;i<list.length;i++){var t=list[i].offsetTop;if(last===null||Math.abs(t-last)>8){out.push([]);last=t;}out[out.length-1].push(list[i]);}return out;}
+  function fit(){
+    var cards=grid.querySelectorAll('.ep-card'),third=cards[2]||cards[cards.length-1];
+    if(third)vp.style.width=(third.offsetLeft+third.offsetWidth-vp.offsetLeft)+'px';
+    vp.className='season-tabs-viewport compact';
+    sc.className='md-scroll season-compact';
+    sc.setAttribute('data-fade-top','80');
+  }
+  fit(); setTimeout(fit,0); setTimeout(fit,360);
+  function label(){var e=Focus.get();return e?(e.textContent||e.getAttribute('data-vid')||''):'';}
+  function measure(){
+    var v=vp.getBoundingClientRect(), card=grid.querySelector('.ep-card').getBoundingClientRect();
+    return {viewportWidth:vp.offsetWidth,blueRight:+v.right.toFixed(1),
+      gap:+(card.top-v.bottom).toFixed(1),compact:vp.className.indexOf('compact')>=0,
+      tabRows:rows(tabs.children).map(function(r){return r.length;}),
+      episodeRows:rows(grid.querySelectorAll('.ep-card')).map(function(r){return r.length;})};
+  }
+  window.measure=function(){return measure();};
+  window.navTest=function(){
+    var ts=tabs.querySelectorAll('.st-tab'), out=[];
+    Focus.set(ts[0]); out.push(['start',label()]);
+    Focus.move('right'); out.push(['right',label()]);
+    Focus.move('down');  out.push(['down',label()]);
+    Focus.move('down');  out.push(['down',label()]);
+    Focus.move('down');  out.push(['down',label()]);
+    Focus.move('up');    out.push(['up',label()]);
+    return out;
+  };
+  window.leftWrapTest=function(){
+    var ts=tabs.querySelectorAll('.st-tab'), out=[];
+    Focus.set(ts[9]); out.push(['row1 last',label()]);
+    Focus.move('left'); out.push(['left',label()]);
+    Focus.set(ts[ts.length-1]); out.push(['final last',label()]);
+    Focus.move('left'); out.push(['left',label()]);
+    return out;
+  };
+  window.singleRowTest=function(){
+    var ts=tabs.querySelectorAll('.st-tab');
+    for(var i=10;i<ts.length;i++)ts[i].parentNode.removeChild(ts[i]);
+    fit();
+    return measure();
+  };
+})();
+</script>
+</body></html>
