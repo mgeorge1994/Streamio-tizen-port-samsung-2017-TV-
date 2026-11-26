@@ -619,14 +619,28 @@ var App = (function () {
   var nextEpisodeHooks = null;  // set by playUrl: pre-load of the next episode
   var cancelNextAutoplay = null; // set by playUrl; stops the Up-next countdown on exit
   var qrTimer = null, statsTimer = null, stallTimer = null, statsSlow = false;
-  var PAUSE_KEEP_MS = 15 * 60 * 1000;  // torrent engine stays alive this long while paused
-  var PAUSE_SOFT_MS = 45 * 1000;       // silent AVPlay reconnect after shorter pauses
-  var pauseStopHook = null;     // set by playUrl; cancels the 15-minute pause timer
+  var ENGINE_IDLE_MS = 300 * 1000;  // Android p2p.c idle_limit(): stop only after 300 s with no player
+  var engineIdleTimer = null;
   var clearPausedLogo = null;   // set by playUrl; removes pause scrim + title art
   var hidePauseArtWithControls = null;  // set by playUrl; hides pause art with the OSD
   var focusReclaimTimer = null;
   var playerClockTimer = null;  // repaints the local clock in the player OSD
   var lastBackHandled = 0;      // Back is handled on keydown and keyup; fire once
+  // Android keeps the torrent alive while paused; it only stops the engine after
+  // a long idle period with no player open. No pause/seek timer is allowed.
+  function clearEngineIdleStop() {
+    if (engineIdleTimer) { clearTimeout(engineIdleTimer); engineIdleTimer = null; }
+  }
+  function armEngineIdleStop() {
+    clearEngineIdleStop();
+    engineIdleTimer = setTimeout(function () {
+      engineIdleTimer = null;
+      var pl = U.qs('#player-layer');
+      if (pl && pl.className.indexOf('hidden') === -1) return;
+      if (!window.Engine || !Engine.getInfo || !Engine.getInfo().engineStarted) return;
+      try { Engine.stop(); } catch (e) {}
+    }, ENGINE_IDLE_MS);
+  }
   // Module-level so the global key handler can log errors even when the player
   // closure is not in scope. playUrl() replaces this with its logger on start.
   var remoteLog = function () {};
@@ -732,6 +746,7 @@ var App = (function () {
 
   function playStream(s, meta, info) {
     currentStream = s; playerData = meta || {};
+    clearEngineIdleStop();   // a player is open again: never idle-stop the torrent
     API.markStreamWatched(s);   // show a "Viewed" indicator next time
     // Remember the exact source so Continue Watching resumes the same torrent.
     API.rememberStream([(info && info.videoId) || (meta && meta.id) || '',
@@ -963,7 +978,6 @@ var App = (function () {
       if (pausedLogo) pausedLogo.className = 'paused-logo show';
     }
     clearPausedLogo = hidePauseArt;
-    pauseStopHook = clearPauseStop;
     hidePauseArtWithControls = function () {
       if (!player || player.paused) return;   // keep the art while still paused
       hidePauseArt(true);
@@ -1017,11 +1031,9 @@ var App = (function () {
     // Record every listener attached below, so they can be moved onto the
     // AVPlay player if the browser <video> cannot decode this stream.
     var playerListeners = [], usingAvPlay = false, lastStats = null, htmlVideo = player, srcSetAt = 0;
-    // Long pauses and AVPlay connection failures need a fresh local HTTP
-    // connection at the same position. Track when the pause started and how
-    // many automatic recoveries have already been attempted.
+    // AVPlay connection failures need a fresh local HTTP connection at the same
+    // position. Track when the pause started and how many recoveries were tried.
     var pausedAt = 0, avRecoveries = 0;
-    var pauseStopTimer = null, pausedTooLong = false, resumeWarmup = null;
     function clampRate(r) { r = Number(r) || 1; return r < 0.25 ? 0.25 : (r > 2 ? 2 : r); }
     var playbackRate = clampRate(U.get('playbackRate', 1));
     var currentVolume = 1, currentMuted = false;
@@ -1103,21 +1115,17 @@ var App = (function () {
       endWarmup();
       seekPending = true; seekFrom = -1;
       hideLoadSpinner();
-      // Backward seeks stay on the current AVPlay/HTTP range. Reopening the URL
-      // makes the local server answer with the whole file from byte 0, then the
-      // native seek lands on data that is not there and AVPlay reports
-      // "cannot decode the file". A straight seekTo keeps the live connection.
+      // Android never reopens for a seek: video_seek() keeps the same player and
+      // the same HTTP range. Reopening makes the local server answer from byte 0
+      // and AVPlay then reports "cannot decode the file". Seek in place so the
+      // engine can serve the spot from its look-behind/read-ahead window.
       var backward = seekTarget < scrubStart - 0.5;
-      var reopened = false;
-      if (!backward && usingAvPlay) reopened = reopenPlayer(seekTarget, wasPlayingBeforeScrub);
-      if (!reopened) {
-        try { player.currentTime = seekTarget; } catch (e) {}
-        // Resume immediately at the released position: the old 1 s delay made
-        // the picture look frozen after a long scrub.
-        if (wasPlayingBeforeScrub && player.paused) { try { player.play(); } catch (e) {} }
-      }
+      try { player.currentTime = seekTarget; } catch (e) {}
+      // Resume immediately at the released position: the old 1 s delay made
+      // the picture look frozen after a long scrub.
+      if (wasPlayingBeforeScrub && player.paused) { try { player.play(); } catch (e) {} }
       remoteLog('seek', { target: seekTarget, duration: player.duration, at: player.currentTime,
-        backward: backward, reopened: reopened });
+        backward: backward, reopened: false });
       showOsd();
     }
     clearSeekTimer = function () {
@@ -1168,108 +1176,23 @@ var App = (function () {
       setTimeout(apply, 400);
       return true;
     }
-    // The engine can stop while AVPlay is paused. Re-send the same torrent with
-    // its peer sources so the local HTTP server comes back before we reopen.
-    function rearmEngine() {
-      if (!opts.infoHash || !window.Engine || !Engine.start) return false;
-      try {
-        Engine.start(opts.infoHash, opts.fileIdx, opts.sources || [], opts.fileName || '');
-        return true;
-      } catch (e) { return false; }
-    }
-    function engineIsStarted() {
-      try { return !!(window.Engine && Engine.getInfo && Engine.getInfo().engineStarted); }
-      catch (e) { return false; }
-    }
-    // Android-style pause: keep the torrent/HTTP server alive for 15 minutes.
-    // Only after that do we stop the engine; pressing Play then needs a fresh
-    // head buffer and shows a spinner that only ever climbs to 100%.
-    function armPauseStop() {
-      if (!opts.infoHash) return;
-      if (pauseStopTimer) { clearTimeout(pauseStopTimer); pauseStopTimer = null; }
-      pauseStopTimer = setTimeout(function () {
-        pauseStopTimer = null;
-        if (!player || !player.paused || layer.className.indexOf('hidden') !== -1) return;
-        pausedTooLong = true;
-        lastStats = null;
-        try { if (window.Engine && Engine.stop) Engine.stop(); } catch (e) {}
-        remoteLog('pause-stop', { afterMs: pausedAt ? Date.now() - pausedAt : 0 }, true);
-      }, PAUSE_KEEP_MS);
-    }
-    function clearPauseStop() {
-      if (pauseStopTimer) { clearTimeout(pauseStopTimer); pauseStopTimer = null; }
-    }
-    function beginResumeWarmup(pos) {
-      var wasStarted = engineIsStarted();
-      // Android-style restart: the fresh engine starts its counter at zero.
-      // From here on updateResumeWarmup() only ever increases the number.
-      resumeWarmup = { pos: pos, pct: 0, started: false };
-      remoteLog('resume-pct', { pct: 0, engineWasOn: wasStarted }, true);
-      beginWarmup(180000);          // spinner up while the fresh head buffer arrives
-      showBufferLoad(true);
-      updateLoadPct(resumeWarmup.pct);
-      rearmEngine();
-      remoteLog('resume-warm', { pos: pos, pauseMs: pausedAt ? Date.now() - pausedAt : 0,
-        engineWasOn: wasStarted }, true);
-    }
-    // Called from the stats poll while the post-15-minute spinner is up. Every
-    // value is clamped to the previous one, so the number never falls back.
-    function updateResumeWarmup(d) {
-      if (!resumeWarmup || !d) return;
-      var target = (d.streamLen && isFinite(d.streamLen) && d.streamLen > 0) ?
-        Math.min(START_BYTES, d.streamLen) : START_BYTES;
-      var bytes = Math.max(d.downloaded || 0, Math.min((d.blocksRx || 0) * 16384, target));
-      var pct = bytes / target * 100;
-      if (!isFinite(pct) || pct < 0) pct = 0;
-      if (pct > 100) pct = 100;
-      if (pct < resumeWarmup.pct) pct = resumeWarmup.pct;
-      resumeWarmup.pct = pct;
-      updateLoadPct(pct);
-      if (pct < 100 || resumeWarmup.started) return;
-      resumeWarmup.started = true;
-      var at = resumeWarmup.pos;
-      resumeWarmup = null;
-      remoteLog('resume-ready', { pos: at, bytes: bytes, target: target }, true);
-      endWarmup();
-      hideLoadSpinner();
-      if (usingAvPlay) reopenPlayer(at, true);
-      else {
-        try {
-          player.src = url; player.load();
-          player.currentTime = at; player.play();
-        } catch (e) {}
-      }
-      setPpIcon('pause');
-      showOsd();
-    }
-
     // One entry point for the hardware Play/Pause key and the on-screen button.
     // Never leave a half-finished scrub behind when toggling playback.
+    // Android's toggle() only calls video_pause()/video_play(): no engine stop,
+    // no reopen, no pause-length threshold.
     function togglePlayback() {
       if (!player || layer.className.indexOf('hidden') !== -1) return;
       if (scrubbing) commitSeek();
-      var wasPaused = !!player.paused, pos = player.currentTime || 0;
+      var wasPaused = !!player.paused, pausedMs = pausedAt ? Date.now() - pausedAt : 0;
       if (wasPaused) {
-        clearPauseStop();   // the user came back before/within the 15-minute window
-        var pausedMs = pausedAt ? Date.now() - pausedAt : 0;
-        if (opts.infoHash && (pausedTooLong || pausedMs >= PAUSE_KEEP_MS)) {
-          // Engine was stopped after 15 minutes: warm a fresh head buffer with
-          // a monotonic 0→100% spinner, then resume automatically.
-          beginResumeWarmup(pos);
-        } else if (usingAvPlay && pausedMs >= PAUSE_SOFT_MS) {
-          // Within the 15-minute window: engine and pieces are still alive.
-          // Reopen the dead AVPlay range request silently so Play lands in film.
-          reopenPlayer(pos, true);
-        } else { try { player.play(); } catch (e) {} }
+        try { player.play(); } catch (e) {}
         setPpIcon('pause');   // pause art goes when the controls hide, together
       } else {
         try { player.pause(); } catch (e) {}
-        armPauseStop();   // keep the torrent/HTTP server alive for 15 minutes
         setPpIcon('play'); showPauseArt();
       }
       remoteLog('toggle', { from: wasPaused ? 'paused' : 'playing', av: !!usingAvPlay,
-        pausedMs: wasPaused ? (pausedAt ? Date.now() - pausedAt : 0) : 0,
-        warm: !!(wasPaused && resumeWarmup) });
+        pausedMs: wasPaused ? pausedMs : 0 });
       showOsd();
     }
     // Left/Right with the controller hidden: real -10/+10 s jump, not just a
@@ -1283,18 +1206,15 @@ var App = (function () {
       endWarmup();
       seekPending = true; seekFrom = -1;
       hideLoadSpinner();
-      // Rewinding only needs a native seekTo inside the range already open on
-      // the local server. Reopening restarted the file at byte 0 and produced
-      // AVPlay decode errors after the wait.
-      var backward = sec < 0, reopened = false;
-      if (!backward && usingAvPlay) reopened = reopenPlayer(t, true);
-      if (!reopened) {
-        try { player.currentTime = t; } catch (e) {}
-        if (player.paused) { try { player.play(); } catch (e) {} }
-      }
+      // Android keeps the same player for every seek: video_seek() never
+      // reloads/reopens a normal stream. A reopen restarts the local server
+      // range at byte 0 and makes AVPlay fail to decode after the jump.
+      var backward = sec < 0;
+      try { player.currentTime = t; } catch (e) {}
+      if (player.paused) { try { player.play(); } catch (e) {} }
       setPpIcon('pause');
       remoteLog('jump', { sec: sec, target: t, paused: player.paused,
-        backward: backward, reopened: reopened });
+        backward: backward, reopened: false });
       showOsd();
     }
     // ---- YouTube-TV style extras -----------------------------------------
@@ -1412,7 +1332,6 @@ var App = (function () {
       pct = Number(pct);
       if (!isFinite(pct)) pct = bufferedPct();
       pct = Math.max(0, Math.min(100, Math.round(pct)));
-      if (resumeWarmup && pct < resumeWarmup.pct) pct = resumeWarmup.pct;
       setHtml(el, pct + '%');
     }
     function showBufferLoad(force) {
@@ -1487,10 +1406,7 @@ var App = (function () {
         // Inside the round loader (seek / buffering): how much of the data
         // needed at the current spot has arrived. Never prefill the hidden
         // loader, or it opens on a stale 100% from the first-load buffer.
-        if (load.className.indexOf('show') !== -1) {
-          if (resumeWarmup) updateResumeWarmup(d);   // monotonic fresh-buffer fill
-          else updateLoadPct(d.bufPct);
-        }
+        if (load.className.indexOf('show') !== -1) updateLoadPct(d.bufPct);
         var spd = fmtRate(d.downloadSpeed);
         setHtml(U.qs('#tl-speed', layer), spd);
         setHtml(U.qs('#osd-speed', layer), spd);   // top OSD, next to seeders
@@ -1585,34 +1501,24 @@ var App = (function () {
       }
       if (Date.now() - lastProgressAt < 8000) return;
       stallKicks++;
-      remoteLog('stall-kick', { t: t, kick: stallKicks, recoveries: stallRecoveries, av: !!usingAvPlay });
-      if (stallKicks >= 3 && stallRecoveries < 3) {
-        // Repeated stalls: reload the same on-TV stream at the last position.
-        stallRecoveries++; stallKicks = 0;
-        opts.resumePos = t; resumeDone = false;
-        if (!reopenPlayer(t, true)) {
-          try { player.src = url; player.load(); player.play(); } catch (e) {}
-        }
-        setTimeout(function () { reclaimRemoteFocus(true); }, 0);
-      } else if (stallKicks <= 2) {
-        // First two stalls: a small backward seek re-kicks the decoder/pipeline.
-        try { player.currentTime = Math.max(0, t - 2); player.play(); } catch (e) {}
-      }
-      lastProgressTime = Math.max(0, t - 2); lastProgressAt = Date.now();
+      remoteLog('stall-kick', { t: t, kick: stallKicks, av: !!usingAvPlay });
+      // Android keeps the same player and shows a circular buffer spinner while
+      // the engine fills the spot. It never reopens or seeks to "kick" a stall:
+      // those actions close the live HTTP range and cause CONNECTION_FAILED.
+      showBufferLoad(true);
+      lastProgressTime = t; lastProgressAt = Date.now();
     }
     if (!stallTimer) stallTimer = setInterval(watchdog, 2000);
 
     // Poll fast (4x/second) so the logo creeps forward as each chunk arrives.
     if (loader) { pollStats(); statsTimer = setInterval(pollStats, 250); }
     player.addEventListener('progress', function () {
-      if (load.className.indexOf('show') !== -1 && !resumeWarmup)
+      if (load.className.indexOf('show') !== -1)
         updateLoadPct(lastStats && lastStats.bufPct != null ? lastStats.bufPct : bufferedPct());
       if (!statsTimer) setLoaderPct(bufferedPct());   // fallback when bridge is down
     });
     player.addEventListener('playing', function () {
       subtitlePlaybackStarted = true;
-      clearPauseStop();
-      pausedTooLong = false;
       pausedAt = 0; avRecoveries = 0;
       // AVPlay emits 'playing' as soon as play() is requested, which can be
       // long before the reopened range has any data. Never clear seekPending
@@ -1650,9 +1556,6 @@ var App = (function () {
     });
     player.addEventListener('pause', function () {
       pausedAt = Date.now();
-      resumeWarmup = null;
-      pausedTooLong = false;
-      armPauseStop();
       endWarmup();
       seekPending = false;
       setPpIcon('play');
@@ -1699,12 +1602,11 @@ var App = (function () {
         else if (nowT - fadeFromTime >= 0.1) fadeOutFirstLoad();
       }
       if (load.className.indexOf('show') !== -1) {
-        if (resumeWarmup) updateResumeWarmup(lastStats);
-        else updateLoadPct(lastStats && lastStats.bufPct != null ? lastStats.bufPct : bufferedPct());
+        updateLoadPct(lastStats && lastStats.bufPct != null ? lastStats.bufPct : bufferedPct());
         // The picture is actually advancing again: drop the buffering spinner
         // even if AVPlay never raised 'playing' after the stall. Never do this
         // mid post-pause warmup: the 100% value owns that spinner.
-        if (!resumeWarmup && !seekPending && player && !player.paused &&
+        if (!seekPending && player && !player.paused &&
             player.currentTime - lastBufferLoadAt >= 1) {
           endWarmup();          // at least a second of real frames: refill done
           hideLoadSpinner();
@@ -1729,29 +1631,26 @@ var App = (function () {
       // The browser <video> could not decode this file: hand the same on-TV
       // URL to Samsung's native AVPlay pipeline (MKV, HEVC, AC3, ...).
       if (player === htmlVideo && switchToAvPlay()) return;
-      // AVPlay code 4 after a long pause or a seek is a dead local HTTP
-      // connection, not a decode failure. Recover at the same frame instead
-      // of making the user replay the stream. Never do this during the first
-      // load, where code 4 can be a real unsupported-format error.
+      // AVPlay code 4 after a pause or seek is a dead local HTTP connection,
+      // not a decode failure. Recover at the same frame instead of making the
+      // user replay the stream. Never do this during the first load, where
+      // code 4 can be a real unsupported-format error.
       if (usingAvPlay && videoStarted && !firstPlay &&
           ((err.code || 0) === 4 || /CONNECTION_FAILED/i.test(err.message || '')) && avRecoveries < 2) {
         avRecoveries++;
         var at = player.currentTime || 0, resume = !player.paused;
-        // Never leave a black frame after the error: the loader stays up while
-        // a fresh connection is made and the range is assembled again.
+        // Never leave a black frame after the error: the circular spinner stays
+        // up while AVPlay reconnects to the SAME url at the SAME position. The
+        // torrent engine is still alive (Android has no engine restart here),
+        // so never rearm it or switch file indexes.
         beginWarmup(30000);
-        var engineOn = true;
-        try { if (window.Engine && Engine.getInfo) engineOn = !!Engine.getInfo().engineStarted; } catch (e) {}
-        // If the engine stopped while paused, restart it and give its HTTP
-        // server time to bind before asking AVPlay to open the stream again.
-        if (!engineOn) rearmEngine();
         remoteLog('av-recover', { attempt: avRecoveries, at: at, resume: resume,
-          rearm: !engineOn, bufPct: lastStats && lastStats.bufPct }, true);
+          rearm: false, bufPct: lastStats && lastStats.bufPct }, true);
         setTimeout(function () {
           if (!player || layer.className.indexOf('hidden') !== -1) return;
           showBufferLoad(true);
           if (reopenPlayer(at, resume)) reclaimRemoteFocus(true);
-        }, engineOn ? 800 : 1200);
+        }, 800);
         return;
       }
       load.className = 'loading';
@@ -2447,7 +2346,9 @@ var App = (function () {
     if (firstLoadFadeTimer) { clearTimeout(firstLoadFadeTimer); firstLoadFadeTimer = null; }
     if (seekKeyupHandler) { document.removeEventListener('keyup', seekKeyupHandler, false); seekKeyupHandler = null; }
     if (osdTimer) { clearTimeout(osdTimer); osdTimer = null; }
-    if (pauseStopHook) { try { pauseStopHook(); } catch (e) {} pauseStopHook = null; }
+    // Android closes the player immediately but leaves the torrent for the
+    // engine's 300 s idle stop. Only an explicit Stop/exit cancels that socket.
+    armEngineIdleStop();
     stopPlayerClock();
     if (clearPausedLogo) { try { clearPausedLogo(); } catch (e) {} clearPausedLogo = null; }
     hidePauseArtWithControls = null;

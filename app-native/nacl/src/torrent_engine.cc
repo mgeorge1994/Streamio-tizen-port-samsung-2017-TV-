@@ -39,7 +39,11 @@
 namespace stremio {
 namespace engine {
 
-static const int kPiecesPerWindow = 64;   // sliding cache: ~16 MB at 256 KB/piece
+// Android p2p.c keeps at least a 24 MB streaming window (W_FLOOR) and protects
+// a look-behind region so a short rewind does not refetch played pieces. 128
+// pieces at 256 KB = 32 MB; 64 pieces (16 MB) behind the head are pinned.
+static const int kPiecesPerWindow = 128;
+static const int kLookBehindPieces = 64;
 static const int kMaxPeers = 35;          // enginefs btMaxConnections
 static const int kBlockSize = 16384;
 // Scheduler constants taken from Stremio's torrent-stream fork -- the download
@@ -640,26 +644,28 @@ static void storePiece(int index, const std::vector<uint8_t>& data) {
   int slot = -1;
   if (it != g_slotOf.end()) slot = it->second;
   else {
-    // Reuse an empty slot, else the piece furthest BEHIND the read head
-    // (already played), else the piece furthest ahead. The old rule only
-    // ever evicted pieces ahead of the head, so once the cache filled with
-    // played data the read-ahead collapsed to a single piece.
-    int best = -1, behindBest = -1, aheadBest = -1, protBest = -1;
-    uint64_t behindDist = 0, aheadDist = 0;
+    // Reuse an empty slot, then the piece furthest behind the protected
+    // look-behind region, then the piece furthest ahead. Played pieces inside
+    // the look-behind window stay cached so Back/Rewind never refetches them,
+    // matching Android's protected `behind` region.
+    int best = -1, oldBest = -1, aheadBest = -1, protBest = -1;
+    uint64_t oldDist = 0, aheadDist = 0;
     int headPiece = g_pieceLength ? (int)(g_wantOffset / g_pieceLength) : 0;
     for (int i = 0; i < (int)g_window.size(); i++) {
       if (!g_window[i].have) { best = i; break; }
       int idx = g_window[i].index;
       if (isPrefetchPiece(idx)) { protBest = i; continue; }   // keep the pre-loaded next episode
-      if (idx < headPiece) {
-        uint64_t d = (uint64_t)(headPiece - idx);
-        if (behindBest < 0 || d > behindDist) { behindDist = d; behindBest = i; }
+      if (idx < headPiece - kLookBehindPieces) {
+        uint64_t d = (uint64_t)(headPiece - kLookBehindPieces - idx);
+        if (oldBest < 0 || d > oldDist) { oldDist = d; oldBest = i; }
+      } else if (idx < headPiece) {
+        protBest = i;   // inside the Android-style look-behind window
       } else {
         uint64_t d = (uint64_t)(idx - headPiece);
         if (aheadBest < 0 || d > aheadDist) { aheadDist = d; aheadBest = i; }
       }
     }
-    if (best < 0) best = behindBest >= 0 ? behindBest : (aheadBest >= 0 ? aheadBest : (protBest >= 0 ? protBest : 0));
+    if (best < 0) best = oldBest >= 0 ? oldBest : (aheadBest >= 0 ? aheadBest : (protBest >= 0 ? protBest : 0));
     slot = best;
     if (g_window[slot].have) g_slotOf.erase(g_window[slot].index);
     g_window[slot].index = index;
