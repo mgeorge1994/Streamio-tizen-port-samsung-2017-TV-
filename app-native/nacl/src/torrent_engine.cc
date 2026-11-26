@@ -29,6 +29,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <map>
 #include <set>
 #include <sstream>
@@ -51,6 +52,7 @@ static const uint64_t kHsWatchdogMs = 12000;  // abandon a handshake stuck this 
 static const int kMinPeers = 40;         // enginefs peerSearch.min: keep searching below this
 static const int kMaxQueuedPeers = 150;  // enginefs peerSearch.max
 static const uint16_t kHttpPort = 11470;
+static const int kMaxHttpClients = 8;     // 1 video stream + stats + a few seeks
 
 // ---------------------------------------------------------------------------
 // small helpers
@@ -253,7 +255,11 @@ struct Tracker {
 };
 
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
-static bool g_running = false;
+// Written on the PPAPI thread, read by the HTTP, peer and discovery threads.
+// A plain bool can be cached in a register at -O2, so stop() would hang on
+// pthread_join() and wedge every later NaCl message.
+static std::atomic<bool> g_running(false);
+static int g_httpClients = 0;   // live serveClient threads, guarded by g_lock
 static std::string g_hashHex;
 static uint8_t g_hash[20];
 // Exactly 20 bytes, Azureus-style, as required by BEP 15 / peer wire.
@@ -271,7 +277,7 @@ static int g_fileIdxReq = 0;       // index as requested in the URL; -1 = guess 
 static std::string g_fileNameHint; // addon behaviorHints.filename
 static std::string g_nextTrackersCsv, g_nextFileName;   // set before start()
 static int g_streamSeq = 0, g_headSeq = 0;   // HTTP streams; newest active one drives the head
-static int g_fileGen = 0;            // bumped when the selected file changes (old streams stop)
+static std::atomic<int> g_fileGen(0); // bumped when the selected file changes (old streams stop)
 // Background pre-load of another file of the same torrent (next episode in a
 // season pack): its first 16 MB and its last piece (MKV/MP4 index).
 static int g_prefetchIdx = -1, g_prefFirst = -1, g_prefLast = -1, g_prefTail = -1;
@@ -306,7 +312,7 @@ static uint64_t g_pumpBytes = 0;
 // Handshakes run on worker threads; finished peers wait here (under g_lock).
 static std::vector<Peer*> g_hsDone;
 static int g_hsInFlight = 0;
-static int g_session = 0;
+static std::atomic<int> g_session(0);
 struct HsJob;
 static std::vector<HsJob*> g_hsJobs;   // running handshake threads (under g_lock)
 // Peer discovery runs on its own threads (trackers in parallel + DHT) and
@@ -1781,7 +1787,9 @@ static void serveClient(int fd) {
     h << "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
       << body.size() << "\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n";
     std::string out = h.str() + body;
-    sendAll(fd, out.data(), out.size()); close(fd); return;
+    // Stats are diagnostic only: never let a stuck poll hold a worker for the
+    // generic 8 s send timeout. Close immediately afterwards.
+    sendAllFor(fd, out.data(), out.size(), 1000); close(fd); return;
   }
 
   g_httpReqs++;
@@ -1858,9 +1866,10 @@ static void serveClient(int fd) {
     if (avail > 512 * 1024) avail = 512 * 1024;   // keep send iterations short
     std::string chunk;
     if (!copyRange(pos, avail, &chunk)) { usleep(50000); continue; }
-    // A paused player stops reading; allow a long send wait before giving up
-    // (the player simply re-requests the range when it resumes).
-    if (!sendAllFor(fd, chunk.data(), chunk.size(), 1800000)) break;   // paused player: keep up to 30 min
+    // A paused player stops reading, but a 30-minute send leaves a detached
+    // worker/fd pinned and can starve the browser UI on this single-core TV.
+    // One minute is plenty: the player re-requests the range when it resumes.
+    if (!sendAllFor(fd, chunk.data(), chunk.size(), 60000)) break;
     pos += chunk.size();
     idleDead = nowMs() + 120000;
   }
@@ -1875,6 +1884,9 @@ static void serveClient(int fd) {
 static void* serveClientThread(void* arg) {
   int fd = (int)(intptr_t)arg;
   serveClient(fd);
+  pthread_mutex_lock(&g_lock);
+  if (g_httpClients > 0) g_httpClients--;
+  pthread_mutex_unlock(&g_lock);
   return 0;
 }
 
@@ -1909,12 +1921,28 @@ static void* httpLoop(void*) {
     if (!waitFd(server, POLLIN, 500)) continue;
     struct sockaddr_in cli; socklen_t cl = sizeof(cli);
     int fd = accept(server, (struct sockaddr*)&cli, &cl);
-    if (fd < 0) continue;
+    if (fd < 0) {
+      // nacl_io poll() keeps reporting sticky POLLIN even when accept() has
+      // nothing to return. Without a sleep this spins at 100% CPU and starves
+      // the browser UI while the decoder keeps the picture moving.
+      if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR || errno == EINPROGRESS)
+        usleep(5000);
+      continue;
+    }
+    pthread_mutex_lock(&g_lock);
+    bool slots = g_httpClients < kMaxHttpClients;
+    if (slots) g_httpClients++;
+    pthread_mutex_unlock(&g_lock);
+    if (!slots) { close(fd); continue; }   // diagnostic polls can be dropped safely
     pthread_t th;
     if (pthread_create(&th, 0, serveClientThread, (void*)(intptr_t)fd) == 0)
       pthread_detach(th);
-    else
+    else {
+      pthread_mutex_lock(&g_lock);
+      g_httpClients--;
+      pthread_mutex_unlock(&g_lock);
       close(fd);
+    }
   }
   close(server);
   return 0;
@@ -2099,7 +2127,7 @@ void start(const std::string& hashHex, int fileIdx) {
   g_depth = g_hotswaps = g_wireTimeouts = g_noHave = 0;
   g_pendingPeers = 0; g_pumpBytes = 0;
   pthread_mutex_lock(&g_lock);
-  g_session++; g_hsInFlight = 0;
+  g_session++; g_hsInFlight = 0; g_httpClients = 0;
   g_discovered.clear(); g_wantPeers = true;
   g_dhtNodes = g_dhtQueries = g_dhtResponses = g_dhtPeers = g_trackerPeers = 0;
   for (size_t i = 0; i < g_hsDone.size(); i++) {

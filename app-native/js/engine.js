@@ -22,9 +22,23 @@
     try { module.postMessage(obj); } catch (e) { note('post-err'); }
   }
 
+  var lastMessage = null, lastMessageAt = 0;
+  // NaCl posts JSON strings, not dictionaries. Older builds dropped every
+  // reply here, so pong/init/started/staged were never seen by the player.
+  function decodeMessage(raw) {
+    if (!raw) return null;
+    if (typeof raw === 'string') {
+      try { return JSON.parse(raw); } catch (e) { return null; }
+    }
+    return (typeof raw === 'object') ? raw : null;
+  }
   function onMessage(e) {
-    var d = e.data;
-    if (!d || typeof d !== 'object') return;
+    var d = decodeMessage(e.data);
+    if (!d) return;
+    // One NaCl message can surface on the embed, document and window.
+    var key = String(e.data), now = Date.now();
+    if (key === lastMessage && now - lastMessageAt < 50) return;
+    lastMessage = key; lastMessageAt = now;
     info.msgs++;
     note('msg:' + (d.event || '?'));
     if (d.event === 'init') {
@@ -34,7 +48,12 @@
       flush();
     }
     if (d.event === 'pong') { info.pong = true; ready = true; flush(); }
-    if (d.event === 'started') { info.engineStarted = true; }
+    if (d.event === 'started') {
+      info.engineStarted = true;
+      lastStart = null;   // acknowledged: stop re-posting the start command
+    }
+    if (d.event === 'stopped') { info.engineStarted = false; }
+    if (d.event === 'stats') { info.lastStats = d.data || null; }
     if (d.event === 'stage') {
       info.stage = (d.name || '?') + ':' + (d.ok ? 'ok' : 'FAIL');
       ready = true;
@@ -77,9 +96,9 @@
   function ping() {
     note('ping');
     send({ cmd: 'ping' });
-    send({ cmd: 'stats' });
-    // Re-post the last start command: messages sent before the NaCl instance
-    // exists are silently dropped, so retry until the engine confirms it.
+    // The player reads /stats over HTTP. Asking NaCl for stats every 3 s used
+    // to add heavy work to its single message thread (v1.0.84 removed this).
+    // Re-post the last start command only until the engine acknowledges it.
     if (lastStart && !info.engineStarted) send(lastStart);
   }
 

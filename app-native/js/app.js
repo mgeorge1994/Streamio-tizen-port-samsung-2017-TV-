@@ -554,10 +554,16 @@ var App = (function () {
   function updateSubtitle() {
     var el = U.qs('#subtitle');
     if (!el) return;
-    // Never paint cues over the first-load logo. Cues only become eligible
-    // once the picture actually starts playing; the default offset is zero,
-    // so video second 0 lines up with subtitle second 0.
-    if (!subtitlePlaybackStarted || !subOn || !subCues.length || !player) { el.innerHTML = ''; return; }
+    // Never paint cues over the first-load logo or over paused artwork. Cues
+    // only become eligible once the picture is actually playing; the default
+    // offset is zero, so video second 0 lines up with subtitle second 0.
+    // Clearing lastSubtitleHtml here is what lets the exact same cue reappear
+    // immediately when the video resumes from its current time.
+    if (!subtitlePlaybackStarted || !subOn || !subCues.length || !player || player.paused) {
+      if (el.innerHTML !== '') el.innerHTML = '';
+      lastSubtitleHtml = '';
+      return;
+    }
     // A +2 s offset means the SRT is 2 s early: match it against t-2.
     var now = player.currentTime || 0, t = now - subOffset, found = null;
     for (var i = 0; i < subCues.length; i++) {
@@ -1303,6 +1309,7 @@ var App = (function () {
     });
     player.addEventListener('pause', function () {
       showPauseArt();
+      updateSubtitle();   // pause art replaces the subtitle line immediately
       showOsd();   // controls stay on screen for as long as the video is paused
     });
     // Skipping forward jumps to a position the player has not fetched yet.
