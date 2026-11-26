@@ -1,6 +1,9 @@
 /* app.js — shell, routing, player, remote handling */
 var App = (function () {
   var view = null, history = [], current = null, toastTimer = null, loadTimer = null;
+  var homeLoadingHeld = false, homeLoadingTimer = null;   // first-open Home waits for last-watched episode
+  var homeDataReady = false, homeDataWaiters = [];        // account library + addons are synced
+  var playerGen = 0;                                      // guards late logo fetches from old playbacks
   var tabs = [
     { id: 'search', label: 'Search', icon: 'search', active: 'search' },
     { id: 'board', label: 'Home', icon: 'home', active: 'home' },
@@ -50,6 +53,36 @@ var App = (function () {
   function isLoading() {
     return !!document.body && (' ' + document.body.className + ' ').indexOf(' page-loading ') !== -1;
   }
+  // First launch holds the Home loading treatment until Views.board has resolved
+  // the last-watched episode into the Continue Watching row. The cap is only a
+  // safety net for a dead addon; a normal request finishes well inside it.
+  function holdHomeLoading() {
+    homeLoadingHeld = true;
+    if (loadTimer) { clearTimeout(loadTimer); loadTimer = null; }
+    if (homeLoadingTimer) clearTimeout(homeLoadingTimer);
+    setLoading(true);
+    homeLoadingTimer = setTimeout(releaseHomeLoading, 30000);
+  }
+  function releaseHomeLoading() {
+    if (homeLoadingTimer) { clearTimeout(homeLoadingTimer); homeLoadingTimer = null; }
+    if (!homeLoadingHeld) return;
+    homeLoadingHeld = false;
+    setLoading(false);
+    refreshTabIcons();
+  }
+  // Views.board starts its first-load work only after the signed-in account
+  // library and addons exist, while the Home skeleton is already on screen.
+  function whenHomeDataReady(cb) {
+    if (!cb) return;
+    if (homeDataReady) { cb(); return; }
+    homeDataWaiters.push(cb);
+  }
+  function markHomeDataReady() {
+    if (homeDataReady) return;
+    homeDataReady = true;
+    var w = homeDataWaiters; homeDataWaiters = [];
+    for (var i = 0; i < w.length; i++) w[i]();
+  }
   function refreshTabIcons() {
     // Selected tab turns WHITE when focus is out in the content/buttons; it is
     // only indigo when the nav bar itself is being navigated.
@@ -58,7 +91,7 @@ var App = (function () {
     // Focus moved into the content (or the first shelf arrived): load styling
     // is no longer needed. Toggle only nav-idle — overwriting className would
     // wipe avplay-active during playback and put the page over the video.
-    if (!inBar && loading) { setLoading(false); loading = false; }
+    if (!inBar && loading && !homeLoadingHeld) { setLoading(false); loading = false; }
     if (document.body) {
       var bc = (' ' + document.body.className + ' ').replace(/ nav-idle /g, ' ');
       document.body.className = (bc + (inBar ? '' : ' nav-idle')).replace(/^\s+|\s+$/g, '').replace(/\s+/g, ' ');
@@ -116,12 +149,19 @@ var App = (function () {
     // a chance to render, whether the data comes from the network or cache.
     setLoading(true);
     if (loadTimer) clearTimeout(loadTimer);
-    loadTimer = setTimeout(function () { setLoading(false); refreshTabIcons(); }, 1200);
+    loadTimer = setTimeout(function () {
+      if (!homeLoadingHeld) setLoading(false);   // first-open Home stays in its loader
+      refreshTabIcons();
+    }, 1200);
     markTab(name);
     Focus.clear();
     Focus.setRoot(U.qs('#app'));
     if (Views.dispose) Views.dispose();
-    if (name === 'board') Views.board(view);
+    if (name === 'board') {
+      var firstOpen = current.params.firstOpen === true;
+      current.params.firstOpen = false;   // Back into Home must not re-hold the loader
+      Views.board(view, firstOpen);
+    }
     else if (name === 'discover') Views.discover(view, false);
     else if (name === 'library') Views.library(view);
     else if (name === 'search') Views.search(view);
@@ -154,6 +194,13 @@ var App = (function () {
     if (opts && opts.fromContinue) p.fromContinue = true;
     navigate('meta', p);
   }
+  // The series details page remembers the season tab it was showing in the
+  // history entry, so Back from an episode's detail page returns to that tab.
+  function rememberSeriesTab(seriesId, season, videoId) {
+    if (!current || current.name !== 'meta' || !current.params) return;
+    if (String(current.params.id) !== String(seriesId)) return;
+    current.params.seriesTab = { season: Number(season) || 0, videoId: videoId || '' };
+  }
   function openStreams(videoId, type, title, metaData) {
     navigate('meta', { id: videoId, type: type, title: title, fromContinue: true });
   }
@@ -172,10 +219,10 @@ var App = (function () {
     var resume = (pr && pr.pos > 0 && !API.finished(pr) && (!em || pr.videoId === vid)) ? pr.pos : 0;
     var meta = { id: item.id, name: item.name, type: type, poster: item.poster,
       background: item.background, logo: item.logo };
-    // Continue Watching already loaded the series meta; reuse it so the
-    // player's previous/next episode buttons are available immediately.
-    var cached = API.cachedMeta('series', item.id);
-    if (cached && cached.meta && cached.meta.videos) meta = cached.meta;
+    // Reuse meta already loaded on the details page: series keeps the
+    // episode list, movies keep their real API title logo.
+    var cached = API.cachedMeta(type === 'series' ? 'series' : 'movie', item.id);
+    if (cached && cached.meta) meta = cached.meta;
     var parsed = API.parseStream(s);
     playStream(s, meta, { title: item.name, quality: parsed.quality, seeders: parsed.seeders,
       progressId: pid, resumePos: resume, videoId: vid, mediaType: type });
@@ -507,7 +554,10 @@ var App = (function () {
   function updateSubtitle() {
     var el = U.qs('#subtitle');
     if (!el) return;
-    if (!subOn || !subCues.length || !player) { el.innerHTML = ''; return; }
+    // Never paint cues over the first-load logo. Cues only become eligible
+    // once the picture actually starts playing; the default offset is zero,
+    // so video second 0 lines up with subtitle second 0.
+    if (!subtitlePlaybackStarted || !subOn || !subCues.length || !player) { el.innerHTML = ''; return; }
     // A +2 s offset means the SRT is 2 s early: match it against t-2.
     var now = player.currentTime || 0, t = now - subOffset, found = null;
     for (var i = 0; i < subCues.length; i++) {
@@ -533,10 +583,12 @@ var App = (function () {
   var playerReturnFocus = null, lastLayerClose = 0;
   var subCues = [], subTracks = [], subOn = true, subUrl = '';
   var subOffset = 0, subSyncKey = '', subAutoSync = true;   // subtitle sync, seconds added to cue times
+  var subtitlePlaybackStarted = false;   // cues stay hidden until the picture is really playing
   var saveProgressNow = null;   // set by playUrl; called on exit to store the final position
   var nextEpisodeHooks = null;  // set by playUrl: pre-load of the next episode
   var cancelNextAutoplay = null; // set by playUrl; stops the Up-next countdown on exit
   var qrTimer = null, statsTimer = null, stallTimer = null, statsSlow = false;
+  var clearPausedLogo = null;   // set by playUrl; removes pause scrim + title art
   var focusReclaimTimer = null;
   // Module-level so the global key handler can log errors even when the player
   // closure is not in scope. playUrl() replaces this with its logger on start.
@@ -608,10 +660,16 @@ var App = (function () {
     for (var i = 0; i < vids.length; i++) {
       if (vids[i].id !== nextId) continue;
       var n = vids[i], se = Number(n.season) || 0, ep = Number(n.episode) || 0;
-      return { title: 'S' + se + ' E' + ep + (n.title ? '  •  ' + n.title : ''),
+      return { title: 'S' + se + ' E' + ep + ((n.title || n.name) ? '  •  ' + (n.title || n.name) : ''),
         thumb: n.thumbnail || n.poster || '' };
     }
     return { title: 'Next episode', thumb: '' };
+  }
+  // Cinemeta names the episode field "name"; other addons use "title".
+  function metaVideo(meta, vid) {
+    var vids = ((meta && meta.videos) || []);
+    for (var i = 0; i < vids.length; i++) if (vids[i].id === vid) return vids[i];
+    return null;
   }
 
   function playStream(s, meta, info) {
@@ -644,17 +702,24 @@ var App = (function () {
     var nav = episodeNeighbors(meta, info.videoId);
     var nextId = info.nextId || nav.nextId;
     var nxi = nextEpisodeInfo(meta, nextId);
+    var curVid = metaVideo(meta, info.videoId);
+    var description = info.description || '';
+    if (!description && curVid) description = curVid.overview || curVid.description || '';
+    if (!description && meta) description = meta.description || meta.overview || '';
     playUrl(url, info.title || parsed.title || s.name, {
       poster: meta && meta.poster, type: 'stream', subtitles: s.subtitles,
+      description: description,
       quality: info.quality || parsed.quality, seeders: info.seeders,
       infoHash: hash, fileIdx: fidx,
       prevId: info.prevId || nav.prevId, nextId: nextId,
-      nextTitle: info.nextTitle || nxi.title, nextThumb: info.nextThumb || nxi.thumb,
+      nextTitle: info.nextTitle || nxi.title,
       preferAv: prefersAvPlay(s),
       id: info.progressId, videoId: info.videoId, resumePos: info.resumePos,
       mediaType: info.mediaType, mediaId: info.videoId || (meta && meta.id),
       subLang: U.get('subLang', 'en'),
-      logo: (meta && (meta.logo || meta.background || meta.poster)) || ''
+      // First-load loader uses only the title logo supplied by the Stremio
+      // API (Harry Potter, Mink, ...). Never fall back to the poster/backdrop.
+      logo: (meta && meta.logo) || ''
     });
   }
   function copy(text) { toast('Magnet copied (storage)'); try { localStorage.setItem('stremio_tv_last_magnet', text); } catch (e) {} }
@@ -674,11 +739,13 @@ var App = (function () {
   // First-load only: the logo fills from left to right as the torrent buffers.
   // Stats from the LAN bridge sit below it; no title, status text or bar.
   function torrentLoaderHtml(opts) {
-    var logo = opts.logo ? '<div class="tl-logo-base" style="background-image:url(\'' + U.attr(opts.logo) + '\')"></div>' +
-      '<div class="tl-logo-mask" id="tl-logo-mask"><div class="tl-logo-color" style="background-image:url(\'' + U.attr(opts.logo) + '\')"></div></div>' : '';
+    var bg = opts.logo ? " style=\"background-image:url('" + U.attr(opts.logo) + "')\"" : '';
     var seeds = (opts.seeders === null || opts.seeders === undefined) ? '\u2014' : U.esc(opts.seeders);
     return '<div class="torrent-loader" id="torrent-loader">' +
-      '<div class="tl-logo">' + logo + '</div>' +
+      '<div class="tl-logo" id="tl-logo"' + (opts.logo ? '' : ' style="display:none"') + '>' +
+      '<div class="tl-logo-base" id="tl-logo-base"' + bg + '></div>' +
+      '<div class="tl-logo-mask" id="tl-logo-mask"><div class="tl-logo-color" id="tl-logo-color"' + bg + '></div></div>' +
+      '</div>' +
       '<div class="tl-stats">' +
       '<div class="tl-stat"><span>Seeders</span><b class="purple" id="tl-seeders">' + seeds + '</b></div>' +
       '<div class="tl-stat"><span>Download speed</span><b id="tl-speed">0 KB/s</b></div>' +
@@ -705,6 +772,11 @@ var App = (function () {
 
   function playUrl(url, title, opts) {
     opts = opts || {};
+    var myGen = ++playerGen;   // late logo lookups must not paint a newer player
+    // Cancel any long-pause art left by the previous playback before this
+    // layer is rebuilt and the closure pointer is replaced.
+    if (clearPausedLogo) { try { clearPausedLogo(); } catch (e) {} clearPausedLogo = null; }
+    subtitlePlaybackStarted = false;
     // The "Up next" card, its countdown and the auto-play all use the same
     // Settings value: N minutes before the end the card appears, counts down
     // over that window, then plays the next episode unless the player is exited.
@@ -746,24 +818,25 @@ var App = (function () {
     if (opts.quality) osdSub += U.esc(opts.quality);
     if (opts.seeders !== null && opts.seeders !== undefined)
       osdSub += (osdSub ? '  •  ' : '') + '\uD83D\uDC64 ' + U.esc(opts.seeders) + ' seeders';
-    // Live download speed from the LAN bridge, right next to the seeders.
-    if (opts.infoHash) osdSub += (osdSub ? '  •  ' : '') + '\u2193 <span id="osd-speed">0 KB/s</span>';
+    // Live download speed stays green, next to quality and seeders.
+    if (opts.infoHash) osdSub += (osdSub ? '  •  ' : '') + '\u2193 <b id="osd-speed">0 KB/s</b>';
     if (!osdSub) osdSub = U.esc(opts.type || '');
     var layer = U.qs('#player-layer');
     layer.className = 'layer'; clearLayer(layer);
     layer.innerHTML = '<div id="video-wrap" style="position:absolute;left:0;top:0;width:1920px;height:1080px;background:#000">' +
       '<video id="video" style="width:1920px;height:1080px;object-fit:contain"' + (opts.infoHash ? '' : (' src="' + U.attr(url) + '" autoplay')) + '></video></div>' +
       (opts.infoHash ? torrentLoaderHtml(opts) : '') +
+      '<div class="pause-underlay" id="pause-underlay"></div>' +
+      '<div class="paused-logo" id="paused-logo"' + (opts.logo ? " style=\"background-image:url('" + U.attr(opts.logo) + "')\"" : '') + '></div>' +
       '<div class="loading" id="load"></div><div class="load-pct" id="load-pct"></div>' +
       '<div class="player-osd" id="osd">' +
-      '<div class="osd-top"><div class="osd-title">' + U.esc(title || 'Playing') + '</div><div class="osd-sub">' + osdSub + '</div></div>' +
+      '<div class="osd-top"><div class="osd-title">' + U.esc(title || 'Playing') + '</div><div class="osd-sub">' + osdSub + '</div>' +
+      '<div class="osd-desc">' + U.esc(opts.description || '') + '</div></div>' +
       '<div class="osd-bottom"><div class="seekbar" id="seek" data-focus="1"><div class="fill" id="fill"></div><div class="knob" id="knob"></div></div>' +
       '<div class="player-controls">' +
       '<span class="pbtn playpause" data-focus="1" data-icon="pause" id="pp"><i style="background-image:' + U.icon('pause') + '"></i></span>' +
       '<span class="pbtn" data-focus="1" data-icon="chevrons_back" id="prev-ep"><i style="background-image:' + U.icon('chevrons_back') + '"></i></span>' +
       '<span class="pbtn" data-focus="1" data-icon="chevrons_forward" id="next-ep-btn"><i style="background-image:' + U.icon('chevrons_forward') + '"></i></span>' +
-      '<span class="pbtn" data-focus="1" data-icon="chevron_back" id="back10"><i style="background-image:' + U.icon('chevron_back') + '"></i></span>' +
-      '<span class="pbtn" data-focus="1" data-icon="chevron_forward" id="fwd10"><i style="background-image:' + U.icon('chevron_forward') + '"></i></span>' +
       '<span class="pbtn" data-focus="1" data-icon="subtitles" id="subtitles"><i style="background-image:' + U.icon('subtitles') + '"></i></span>' +
       '<span class="pbtn" data-focus="1" data-icon="audio_tracks" id="audio"><i style="background-image:' + U.icon('audio_tracks') + '"></i></span>' +
       '<span class="pbtn" data-focus="1" data-icon="audio" id="mute"><i style="background-image:' + U.icon('audio') + '"></i></span>' +
@@ -775,23 +848,59 @@ var App = (function () {
       '<div class="player-menu" id="pmenu"></div>' +
       '<div class="next-episode" id="next-ep">' +
       '<div class="ne-card">' +
-      '<div class="ne-thumb" id="next-ep-thumb"></div>' +
       '<div class="ne-info"><div class="ne-kicker" id="next-ep-kicker">UP NEXT</div>' +
       '<div class="ne-title" id="next-ep-title">' + U.esc(opts.nextTitle || 'Next episode') + '</div>' +
       '<div class="ne-progress" id="next-ep-progress"></div></div>' +
       '<div class="ne-action" id="next-ep-action" data-focus="1">▶ Next Episode</div>' +
       '</div></div>';
     Focus.setRoot(layer);
-    var nextThumb = U.qs('#next-ep-thumb', layer);
-    if (nextThumb && opts.nextThumb) nextThumb.style.backgroundImage = 'url("' + U.attr(opts.nextThumb) + '")';
+    // Pause-only treatment: a 20% black scrim, then the exact API title logo
+    // from the loader at 100 px top/left. Both disappear on play/stop.
+    var pausedLogo = U.qs('#paused-logo', layer);
+    var pauseUnderlay = U.qs('#pause-underlay', layer);
+    function hidePauseArt() {
+      if (pausedLogo) pausedLogo.className = 'paused-logo';
+      if (pauseUnderlay) pauseUnderlay.className = 'pause-underlay';
+    }
+    function showPauseArt() {
+      if (!player || !player.paused || !videoStarted) { hidePauseArt(); return; }
+      if (pauseUnderlay) pauseUnderlay.className = 'pause-underlay show';
+      if (pausedLogo) pausedLogo.className = 'paused-logo show';
+    }
+    clearPausedLogo = hidePauseArt;
+    // Movie Continue Watching items can arrive from the account library without
+    // a logo. Fetch the real API meta.logo only in that case — never a poster
+    // or backdrop — and paint both the loader and the pause art when it lands.
+    if (!opts.logo) {
+      var logoType = opts.mediaType === 'series' ? 'series' : 'movie';
+      var logoId = logoType === 'series' ? (opts.id || opts.videoId) : (opts.videoId || opts.id);
+      if (logoId && API.getMeta) {
+        API.getMeta(logoType, logoId, function (d) {
+          var u = d && d.meta && d.meta.logo;
+          if (!u || myGen !== playerGen || layer.className.indexOf('hidden') !== -1) return;
+          opts.logo = u;
+          var tl = U.qs('#tl-logo', layer);
+          if (tl) tl.style.display = 'block';
+          var base = U.qs('#tl-logo-base', layer);
+          if (base) base.style.backgroundImage = "url('" + U.attr(u) + "')";
+          var color = U.qs('#tl-logo-color', layer);
+          if (color) color.style.backgroundImage = "url('" + U.attr(u) + "')";
+          var pl = U.qs('#paused-logo', layer);
+          if (pl) pl.style.backgroundImage = "url('" + U.attr(u) + "')";
+        });
+      }
+    }
     subCues = []; subOn = true; subUrl = ''; lastSubtitleHtml = ''; lastTimeText = '';
     subTracks = opts.subtitles || [];
     loadSavedSubOffset(opts.videoId || opts.mediaId || (title ? 'title:' + title : ''));
     applySubtitleSettings();
-    // Episode skip buttons are only meaningful for series episodes.
-    if (!opts.prevId) { var pbtn = U.qs('#prev-ep', layer); if (pbtn) pbtn.style.display = 'none'; }
+    // Episode buttons stay in the control bar where the skip chevrons were.
+    // For a movie they are dimmed and explain why when pressed.
+    if (!opts.prevId) {
+      var pbtn = U.qs('#prev-ep', layer); if (pbtn) pbtn.setAttribute('data-disabled', '1');
+    }
     if (!opts.nextId) {
-      var nbtn = U.qs('#next-ep-btn', layer); if (nbtn) nbtn.style.display = 'none';
+      var nbtn = U.qs('#next-ep-btn', layer); if (nbtn) nbtn.setAttribute('data-disabled', '1');
       var nep = U.qs('#next-ep', layer); if (nep) nep.style.display = 'none';
     }
     // Subtitles come from the installed subtitle addons, in the language
@@ -895,8 +1004,8 @@ var App = (function () {
       if (!player || layer.className.indexOf('hidden') !== -1) return;
       if (scrubbing) commitSeek();
       var wasPaused = !!player.paused;
-      if (wasPaused) { try { player.play(); } catch (e) {} setPpIcon('pause'); }
-      else { try { player.pause(); } catch (e) {} setPpIcon('play'); }
+      if (wasPaused) { try { player.play(); } catch (e) {} setPpIcon('pause'); hidePauseArt(); }
+      else { try { player.pause(); } catch (e) {} setPpIcon('play'); showPauseArt(); }
       remoteLog('toggle', { from: wasPaused ? 'paused' : 'playing', av: !!usingAvPlay });
       showOsd();
     }
@@ -954,7 +1063,8 @@ var App = (function () {
     function stepEpisode(dir) {
       var id = dir > 0 ? opts.nextId : opts.prevId;
       var b = U.qs(dir > 0 ? '#next-ep-btn' : '#prev-ep', layer);
-      if (id && b && b.onclick && b.style.display !== 'none') b.onclick();
+      var disabled = b && b.getAttribute('data-disabled') === '1';
+      if (id && b && b.onclick && !disabled) b.onclick();
       else toast(dir > 0 ? 'No next episode' : 'No previous episode');
     }
     function toggleInfo() {
@@ -980,6 +1090,10 @@ var App = (function () {
       var osd = U.qs('#osd', layer);
       if (!osd || osd.style.opacity === '0' || Focus.get() === seekEl) {
         togglePlayback();
+        // OK with hidden controls pauses/plays and parks focus on the button
+        // that performed the action, so the next OK press is predictable.
+        var pp = U.qs('#pp', layer);
+        if (pp) Focus.set(pp);
         return true;
       }
       return false;   // a focused control button handles its own OK
@@ -1162,10 +1276,13 @@ var App = (function () {
       if (!statsTimer) setLoaderPct(bufferedPct());   // fallback when bridge is down
     });
     player.addEventListener('playing', function () {
+      subtitlePlaybackStarted = true;
+      updateSubtitle();
+      hidePauseArt();       // pause art is never shown over a playing picture
       hideLoadSpinner();   // spinner is first-load only, never over the picture
       if (loader) {
         firstPlay = false;
-        // Keep polling: the top-OSD download speed stays live during playback.
+        // Keep polling: the green download speed stays live during playback.
         setTimeout(function () {
           if (layer.className.indexOf('hidden') === -1) loader.className = 'torrent-loader hidden';
         }, 450);
@@ -1183,6 +1300,10 @@ var App = (function () {
       // Never bring the circular spinner back once the picture is up. The
       // first-load logo/direct spinner already covered the initial wait.
       hideLoadSpinner();
+    });
+    player.addEventListener('pause', function () {
+      showPauseArt();
+      showOsd();   // controls stay on screen for as long as the video is paused
     });
     // Skipping forward jumps to a position the player has not fetched yet.
     // Show the spinner and keep it up until data at the new spot is ready.
@@ -1366,8 +1487,6 @@ var App = (function () {
       var b = U.qs('#pp', layer);
       if (b) { b.setAttribute('data-icon', n); refreshTabIcons(); }
     }
-    U.qs('#back10', layer).onclick = function () { player.currentTime = Math.max(0, player.currentTime - 10); };
-    U.qs('#fwd10', layer).onclick = function () { player.currentTime = Math.min(player.duration || 0, player.currentTime + 10); };
     function reloadCaptionTracks(lang) {
       if (!opts.mediaId) return;
       API.getSubtitles(opts.mediaType || 'movie', opts.mediaId, lang, function (tracks) {
@@ -1455,32 +1574,34 @@ var App = (function () {
     U.qs('#mute', layer).onclick = toggleMute;
     U.qs('#speed', layer).onclick = openSpeedMenu;
     function gotoEpisode(id, dir) {
-      if (!id) return;
+      if (!id) { toast(dir === 'prev' ? 'No previous episode' : 'No next episode'); return; }
       remoteLog('episodenav', { dir: dir, id: id });
       stopPlayer();
       layer.className = 'layer hidden';
       openMeta(id, 'series', { fromContinue: true });
     }
-    U.qs('#prev-ep', layer).onclick = function () { gotoEpisode(opts.prevId, 'prev'); };
-    // Next episode, like Stremio's binge watching: its stream is picked in
-    // advance (same torrent first, then the same bingeGroup, then the best
-    // source). If it is in the same torrent (season pack), the engine starts
-    // downloading it in the background "Pre-load next episode" minutes before
-    // the end, so pressing Next Episode starts it at once.
-    var nextStream = null, nextResolving = false, nextWaiters = [];
-    function resolveNext(cb) {
-      if (nextStream) { if (cb) cb(nextStream); return; }
-      if (cb) nextWaiters.push(cb);
-      if (nextResolving || !opts.nextId) return;
-      nextResolving = true;
-      API.getStreams('series', opts.nextId, function (list) {
+    // Both episode buttons use the same direct binge path as the end-of-episode
+    // prompt: pick the stream in advance, never send the user to the torrent
+    // list. Same torrent first, then the bingeGroup, then the best source.
+    var epStreams = {
+      next: { stream: null, resolving: false, waiters: [] },
+      prev: { stream: null, resolving: false, waiters: [] }
+    };
+    function resolveEpisode(dir, cb) {
+      var st = epStreams[dir], id = dir === 'next' ? opts.nextId : opts.prevId;
+      if (!id) { if (cb) cb(null); return; }
+      if (st.stream) { if (cb) cb(st.stream); return; }
+      if (cb) st.waiters.push(cb);
+      if (st.resolving) return;
+      st.resolving = true;
+      API.getStreams('series', id, function (list) {
         list = list || [];
         var cur = currentStream || {}, bg = cur.behaviorHints && cur.behaviorHints.bingeGroup, pick = null, i;
         for (i = 0; i < list.length && !pick; i++) if (opts.infoHash && API.infoHash(list[i]) === opts.infoHash) pick = list[i];
         for (i = 0; i < list.length && !pick && bg; i++) if (list[i].behaviorHints && list[i].behaviorHints.bingeGroup === bg) pick = list[i];
         for (i = 0; i < list.length && !pick; i++) if (API.streamUrl(list[i])) pick = list[i];
-        nextStream = pick;
-        var w = nextWaiters; nextWaiters = [];
+        st.stream = pick;
+        var w = st.waiters; st.waiters = [];
         for (i = 0; i < w.length; i++) w[i](pick);
       });
     }
@@ -1488,7 +1609,7 @@ var App = (function () {
     function preloadNext() {
       if (preloadAsked || !opts.nextId) return;
       preloadAsked = true;
-      resolveNext(function (s) {
+      resolveEpisode('next', function (s) {
         if (!s || !player || layer.className.indexOf('hidden') !== -1) return;
         var same = !!opts.infoHash && API.infoHash(s) === opts.infoHash;
         remoteLog('preload', { nextId: opts.nextId, sameTorrent: same, fileIdx: API.fileIdx(s) });
@@ -1496,26 +1617,28 @@ var App = (function () {
       });
     }
     nextEpisodeHooks = { preload: preloadNext };
-    function playNextNow() {
-      if (!opts.nextId) return;
-      // Leaving this episode for the next one counts as watching it.
+    function playAdjacentNow(dir, id, missing) {
+      if (!id) { toast(missing); return; }
       nextAutoFired = true;
       var watchedId = opts.videoId || opts.id;
       if (watchedId) API.markWatched(watchedId, true);
       if (saveProgressNow) { try { saveProgressNow(); } catch (e) {} }
-      // playStream() rebuilds the layer with its own first-load loader.
       hideLoadSpinner();
-      resolveNext(function (s) {
-        if (!s) { gotoEpisode(opts.nextId, 'next'); return; }    // no source: show the list
+      resolveEpisode(dir, function (s) {
+        if (!s) { gotoEpisode(id, dir); return; }    // no source: only then show the list
         var meta = playerData || {}, v = null, vs = meta.videos || [];
-        for (var i = 0; i < vs.length; i++) if (vs[i].id === opts.nextId) v = vs[i];
-        var title = (meta.name || '') + (v ? ' \u2014 S' + v.season + ' E' + v.episode + (v.title ? '  \u2022  ' + v.title : '') : '');
-        remoteLog('episodenav', { dir: 'next-direct', id: opts.nextId, sameTorrent: API.infoHash(s) === opts.infoHash });
+        for (var i = 0; i < vs.length; i++) if (vs[i].id === id) v = vs[i];
+        var epName = v ? (v.title || v.name) : '';
+        var title = (meta.name || '') + (v ? ' \u2014 S' + v.season + ' E' + v.episode + (epName ? '  \u2022  ' + epName : '') : '');
         var sameTorrent = !!opts.infoHash && API.infoHash(s) === opts.infoHash;
+        remoteLog('episodenav', { dir: dir + '-direct', id: id, sameTorrent: sameTorrent });
         stopPlayer(sameTorrent);
-        playStream(s, meta, { title: title, videoId: opts.nextId, progressId: opts.id, mediaType: 'series' });
+        playStream(s, meta, { title: title, videoId: id, progressId: opts.id, mediaType: 'series' });
       });
     }
+    function playNextNow() { playAdjacentNow('next', opts.nextId, 'No next episode'); }
+    function playPrevNow() { playAdjacentNow('prev', opts.prevId, 'No previous episode'); }
+    U.qs('#prev-ep', layer).onclick = playPrevNow;
     U.qs('#next-ep-btn', layer).onclick = playNextNow;
     U.qs('#next-ep', layer).onclick = playNextNow;
     U.qs('#next-ep-action', layer).onclick = playNextNow;
@@ -1536,7 +1659,7 @@ var App = (function () {
     //   LEFT/RIGHT on the seek bar -> scrub; the longer you hold, the faster
     //   UP/DOWN -> cycle through all controls (incl. seek bar)
     //   OK      -> activate the focused control
-    var btnOrder = ['pp', 'prev-ep', 'back10', 'fwd10', 'subtitles', 'audio', 'mute', 'speed', 'next-ep-btn'];
+    var btnOrder = ['pp', 'prev-ep', 'next-ep-btn', 'subtitles', 'audio', 'mute', 'speed'];
     var ctrlOrder = ['seek'].concat(btnOrder).concat(['next-ep-action']);
     function moveHorizontal(dir) {
       var f = Focus.get(), idx = -1, i;
@@ -1617,6 +1740,13 @@ var App = (function () {
           showOsd(true);
           return true;
         }
+        // Up from the seek bar returns to the Next Episode button even after
+        // the controller has auto-hidden; it must not merely reveal the bar.
+        if (k === 38 && nextShowing && Focus.get() === seekEl && na) {
+          Focus.set(na);
+          hideOsd();
+          return true;
+        }
         showOsd();                                    // controls appear with the seek bar focused
         if (k === 38 || k === 40) return true;        // first Up/Down only reveals them
       }
@@ -1638,10 +1768,10 @@ var App = (function () {
           if (onSeek) Focus.set(U.qs('#pp', layer));
           return true;
         }
-        // With the Next Episode prompt on screen, Up from the seek bar reaches
-        // Play/Pause. In every other case Up dismisses the controller.
+        // With the Next Episode prompt on screen, Up from the seek bar goes
+        // straight back to its action button (and hides the controls again).
         if (nextShowing && onSeek) {
-          Focus.set(U.qs('#pp', layer)); showOsd(); return true;
+          Focus.set(na); hideOsd(); return true;
         }
         hideOsd();
         return true;
@@ -1688,9 +1818,11 @@ var App = (function () {
   }
   function buildMenuPanel(pm, title, rows, level, total, focusIdx, parentTitle, isCurrent) {
     var panel = U.el('div', 'pm-panel level-' + level + (isCurrent ? ' current' : ''));
+    // Every drawer is opaque and fills the full screen height; only the
+    // horizontal step changes as submenus stack to the left.
     panel.style.right = (level * 406) + 'px';
-    panel.style.top = (level * 58) + 'px';
-    panel.style.bottom = (level * 58) + 'px';
+    panel.style.top = '0px';
+    panel.style.bottom = '0px';
     panel.style.zIndex = String(total - level);
     var head = '';
     if (level > 0) head += '<div class="pm-crumb">' + U.esc(parentTitle || '') + ' \u203a</div>';
@@ -1816,7 +1948,7 @@ var App = (function () {
   // opens it is pushed above the seek bar / button row instead of overlapping.
   function positionNextEp(controlsOpen) {
     var nb = U.qs('#next-ep');
-    if (nb) nb.style.bottom = controlsOpen ? '250px' : '155px';
+    if (nb) nb.style.bottom = controlsOpen ? '250px' : '60px';
   }
   function hideOsd() {
     var osd = U.qs('#osd');
@@ -1848,9 +1980,13 @@ var App = (function () {
     resetOsd();
   }
   function resetOsd() {
-    if (osdTimer) clearTimeout(osdTimer);
+    if (osdTimer) { clearTimeout(osdTimer); osdTimer = null; }
+    // Paused video keeps its controls; only a playing picture auto-hides them.
+    if (player && player.paused) return;
     osdTimer = setTimeout(function () {
-      var osd = U.qs('#osd'); if (osd) osd.style.opacity = '0';
+      // Use hideOsd() so the Up-next card drops back to its resting corner
+      // whenever the controller disappears, not only on an explicit key.
+      hideOsd();
     }, 3500);
   }
   function stopPlayer(keepEngine) {
@@ -1863,6 +1999,8 @@ var App = (function () {
     if (clearSeekTimer) { clearSeekTimer(); clearSeekTimer = null; }
     if (seekKeyupHandler) { document.removeEventListener('keyup', seekKeyupHandler, false); seekKeyupHandler = null; }
     if (osdTimer) { clearTimeout(osdTimer); osdTimer = null; }
+    if (clearPausedLogo) { try { clearPausedLogo(); } catch (e) {} clearPausedLogo = null; }
+    subtitlePlaybackStarted = false;
     Focus.onKey(null);
     playerToggle = null; playerJump = null; playerStop = null; playerInfo = null;
     playerMute = null; playerVolume = null; playerStep = null; playerOk = null;
@@ -1940,20 +2078,33 @@ var App = (function () {
     setTimeout(function () {
       U.qs('#splash').style.display = 'none';
       U.qs('#app').style.display = 'block';
-      navigate('board');
+      // Show the Home screen immediately; its skeleton stays up until the
+      // account data and the first shelves are all ready.
       var au = API.auth();
       if (au && au.authKey) {
-        API.syncLibrary(au.authKey, function () {}, function () {});
-        API.userAddons(au.authKey, function (list) { if (list.length) API.saveAddons(list); }, function () {});
+        holdHomeLoading();
+        var ready = 0;
+        function oneReady() { if (++ready >= 2) markHomeDataReady(); }
+        API.syncLibrary(au.authKey, oneReady, oneReady);
+        API.userAddons(au.authKey, function (list) {
+          if (list.length) API.saveAddons(list);
+          oneReady();
+        }, oneReady);
+        setTimeout(markHomeDataReady, 9000);   // a dead account must not block the TV
+      } else {
+        markHomeDataReady();
       }
+      navigate('board', { firstOpen: true });
     }, 700);
   }
 
   return { init: init, navigate: navigate, back: back, openMeta: openMeta, openStreams: openStreams,
-    continueWatching: continueWatching,
+    rememberSeriesTab: rememberSeriesTab, continueWatching: continueWatching,
     playUrl: playUrl, playStream: playStream, toast: toast, installAddon: installAddon,
     modal: modal, closeLayers: closeLayers, textInput: textInput,
     account: account, updateProfile: updateProfile, syncAddons: syncAddons, syncLibrary: syncLibrary,
+    holdHomeLoading: holdHomeLoading, releaseHomeLoading: releaseHomeLoading,
+    whenHomeDataReady: whenHomeDataReady,
     SUB_COLORS: SUB_COLORS, subtitleColorName: colorName,
     applySubtitleSettings: applySubtitleSettings,
     subSyncText: function () { return subSyncLabel(subOffset); },

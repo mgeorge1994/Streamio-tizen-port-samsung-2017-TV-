@@ -16,7 +16,8 @@ img{border:0}
 
 /* ---------- splash ---------- */
 #splash{position:fixed;left:0;top:0;width:1920px;height:1080px;background:#0C0B11;z-index:200;display:block}
-.splash-logo{position:absolute;left:50%;top:50%;width:216px;height:216px;margin:-108px 0 0 -108px;
+/* Boot logo: 68% of the 1920 px screen (15% smaller), centred both ways. */
+.splash-logo{position:absolute;left:50%;top:50%;width:1306px;height:727px;margin:-364px 0 0 -653px;
   background:url('../assets/icons/stremio_logo_dark.png') no-repeat center/contain;animation:pulse 1.4s ease-in-out infinite}
 @keyframes pulse{0%,100%{opacity:.55;transform:scale(.96)}50%{opacity:1;transform:scale(1)}}
 
@@ -212,11 +213,12 @@ body.page-loading .tab.focused .bar{background:#7B5BF5}
 /* episode grid */
 .ep-grid{width:1750px}
 .ep-card{display:inline-block;width:506px;vertical-align:top;margin:0 20px 22px 0;border-radius:10px;background:#18181C;
-  border:2px solid transparent;padding-bottom:12px;cursor:pointer;outline:none;overflow:hidden}
-.ep-card.focused{border-color:#7B5BF5;background:#202028;transform:scale(1.02)}
+  border:2px solid rgba(255,255,255,.22);padding-bottom:12px;cursor:pointer;outline:none;overflow:hidden}
+.ep-card.focused{border-color:#7B5BF5;background:#202028;transform:scale(1.02);
+  box-shadow:0 0 0 5px rgba(123,91,245,.5)}
 .ep-thumb{position:relative;width:506px;height:285px;background:#101014 center center no-repeat;background-size:cover;margin-bottom:10px}
 .ep-num{position:absolute;left:10px;top:10px;background:rgba(0,0,0,.78);border-radius:5px;padding:3px 9px;font-size:16px;font-weight:700}
-/* Episode watched state: green check for watched, hollow dot for unwatched. */
+/* Episode cards: neutral gray outline; purple is reserved for focus. */
 .ep-watched,.ep-unwatched{position:absolute;right:10px;top:10px;width:30px;height:30px;border-radius:50%;
   font-size:19px;font-weight:800;line-height:30px;text-align:center;box-shadow:0 2px 8px rgba(0,0,0,.5)}
 .ep-watched{background:#2ECC71;color:#06210f}
@@ -302,6 +304,8 @@ body.page-loading .tab.focused .bar{background:#7B5BF5}
 .search-scroll{top:705px;padding-left:60px;
   -webkit-mask-image:linear-gradient(to bottom,rgba(0,0,0,0) 0,#000 120px);
   mask-image:linear-gradient(to bottom,rgba(0,0,0,0) 0,#000 120px)}
+/* Start the Movies shelf below the fade band so Down reveals its title too. */
+.search-scroll .row:first-child{margin-top:120px}
 
 /* ---------- settings ---------- */
 .settings-wrap{margin:44px 60px;display:block}
@@ -337,41 +341,46 @@ body.page-loading .tab.focused .bar{background:#7B5BF5}
 #player-layer{background:#000;z-index:120}
 #avplay{position:absolute;left:0;top:0;width:1920px;height:1080px;background:#000}
 .player-osd{position:absolute;left:0;top:0;width:1920px;height:1080px;z-index:3;pointer-events:none}
-/* YouTube-style bottom fade: 20% translucent (80% black) at the very bottom,
-   fully transparent just above the seek bar, so the controls stay readable. */
-.player-osd::before{content:"";position:absolute;left:0;bottom:0;width:1920px;height:380px;z-index:0;pointer-events:none;
-  background:linear-gradient(to top,rgba(0,0,0,.8) 0%,rgba(0,0,0,.55) 22%,rgba(0,0,0,.2) 38%,rgba(0,0,0,0) 50%)}
-.osd-top{position:absolute;left:0;top:0;width:1920px;height:190px;padding:40px 60px;z-index:1;background:linear-gradient(to bottom,rgba(0,0,0,.75),transparent)}
-.osd-title{font-size:46px;font-weight:700}
-.osd-sub{font-size:25px;color:rgba(255,255,255,.7);margin-top:8px}
-.osd-bottom{position:absolute;left:0;bottom:0;width:1920px;height:230px;padding:0 60px 34px;z-index:1;background:none}
-.seekbar{position:relative;height:10px;border-radius:5px;background:rgba(255,255,255,.25);margin-bottom:26px}
+/* YouTube-style bottom fade: title, description and controls share one scrim. */
+.player-osd::before{content:"";position:absolute;left:0;bottom:0;width:1920px;height:430px;z-index:0;pointer-events:none;
+  background:linear-gradient(to top,rgba(0,0,0,.94) 0%,rgba(0,0,0,.72) 42%,rgba(0,0,0,0) 100%)}
+/* Title, quality/seeders/speed and description sit directly above the seek bar. */
+.osd-top{position:absolute;left:100px;right:100px;bottom:226px;z-index:1;background:none}
+.osd-title{font-size:46px;line-height:1.1;font-weight:700;text-shadow:0 2px 12px rgba(0,0,0,.8)}
+.osd-sub{font-size:24px;line-height:1.2;color:rgba(255,255,255,.66);margin-top:8px}
+.osd-sub b{color:#2ECC71;font-weight:600}
+.osd-desc{font-size:24px;line-height:1.35;color:rgba(255,255,255,.78);margin-top:12px;max-width:1460px;
+  max-height:66px;overflow:hidden;text-shadow:0 2px 10px rgba(0,0,0,.75)}
+.osd-desc:empty{display:none}
+.osd-bottom{position:absolute;left:0;bottom:0;width:1920px;height:300px;z-index:1;background:none}
+.seekbar{position:absolute;left:100px;right:100px;bottom:170px;height:10px;border-radius:5px;background:rgba(255,255,255,.28);margin:0}
 .seekbar .fill{position:absolute;left:0;top:0;height:10px;border-radius:5px;background:#7B5BF5;width:0}
 .seekbar .knob{position:absolute;top:-9px;width:28px;height:28px;border-radius:50%;background:#7B5BF5;left:0;margin-left:-14px;display:none}
 .seekbar.focused .knob,.seekbar.scrubbing .knob{display:block}
-.player-controls{display:block;white-space:nowrap;height:88px}
+.player-controls{position:absolute;left:100px;right:100px;bottom:62px;display:block;white-space:nowrap;height:74px}
 /* icon-only controls — no circular button chrome */
 .pbtn{display:inline-block;width:52px;height:52px;margin-right:26px;border-radius:10px;background:transparent;outline:none;cursor:pointer;position:relative;pointer-events:auto;vertical-align:middle}
 .pbtn i{position:absolute;left:10px;top:10px;width:32px;height:32px;background-repeat:no-repeat;background-position:center;background-size:contain;opacity:.82}
 .pbtn.focused{background:transparent}
 .pbtn.focused i{opacity:1}
+/* Episode buttons stay visible in place of the removed skip chevrons. */
+.pbtn[data-disabled="1"] i{opacity:.25}
+.pbtn[data-disabled="1"].focused i{opacity:.45}
 /* Only the primary play/pause button sits in a circle and is larger. */
 .pbtn.playpause{width:80px;height:80px;margin-right:34px;border-radius:50%;background:rgba(255,255,255,.12)}
 .pbtn.playpause.focused{background:rgba(123,91,245,.32)}
 .pbtn.playpause i{left:16px;top:16px;width:48px;height:48px}
 .time{font-size:23px;color:rgba(255,255,255,.75);display:inline-block;vertical-align:middle;line-height:88px;margin-left:10px}
-/* V3 continuous split drawer. Root is flush right and full height; each
-   submenu sits to its left, shorter and more transparent, with a soft shadow. */
+/* V3 continuous split drawer. Every level is fully opaque, full height and
+   borderless; each submenu sits to the left of its parent with a soft shadow. */
 .player-menu{position:absolute;left:0;top:0;width:1920px;height:1080px;z-index:8;pointer-events:none;display:none}
 .player-menu.open{display:block}
 .pm-panel{position:absolute;width:430px;padding:34px 26px 30px;border-radius:18px 0 0 18px;
-  border:1px solid rgba(255,255,255,.09);border-right:0;
-  box-shadow:-14px 0 30px rgba(0,0,0,.58);pointer-events:auto;overflow:hidden;
+  border:0;box-shadow:-14px 0 30px rgba(0,0,0,.58);pointer-events:auto;overflow:hidden;
   display:flex;flex-direction:column;
   white-space:nowrap;color:rgba(255,255,255,.86);text-shadow:0 2px 5px rgba(0,0,0,.9)}
-.pm-panel.level-0{background:rgba(24,24,28,.92)}
-.pm-panel.level-1{background:rgba(24,24,28,.74);border-color:rgba(123,91,245,.32)}
-.pm-panel.level-2{background:rgba(24,24,28,.64);border-color:rgba(123,91,245,.3)}
+.pm-panel.level-0,.pm-panel.level-1,.pm-panel.level-2,.pm-panel.level-3,.pm-panel.level-4,.pm-panel.level-5{
+  background:#18181C}
 .pm-head{flex:none;margin-bottom:30px}
 .pm-crumb{font-size:17px;line-height:22px;color:#b9a9ff;font-weight:700;letter-spacing:1px;margin-bottom:18px}
 .pm-title{font-size:34px;line-height:42px;font-weight:700;color:#fff}
@@ -385,16 +394,14 @@ body.page-loading .tab.focused .bar{background:#7B5BF5}
 .pm-chev{display:inline-block;width:22px;margin-right:14px;flex:none;font-size:30px;line-height:1;color:#b9a9ff;font-weight:700}
 .pm-row.focused .pm-chev,.pm-row.path .pm-chev{color:#fff}
 .pm-label{display:inline-block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.pm-note{flex:none;margin-top:22px;padding-top:18px;border-top:1px solid rgba(255,255,255,.12);
+.pm-note{flex:none;margin-top:22px;padding-top:18px;
   font-size:17px;line-height:24px;color:#b5b0c4;white-space:normal}
-/* V2 Up-next card: dark container, 16:9 still, title and action. Only the
+/* V2 Up-next card: title/progress and action only, no thumbnail. Only the
    action button is focusable; the card itself never takes the focus ring. */
-.next-episode{position:absolute;right:60px;bottom:155px;pointer-events:auto;display:none;z-index:6;transition:bottom .18s ease}
+.next-episode{position:absolute;right:60px;bottom:60px;pointer-events:auto;display:none;z-index:6;transition:bottom .18s ease}
 .next-episode.show{display:block}
 .ne-card{display:flex;align-items:center;width:620px;min-height:112px;padding:12px 16px;border-radius:14px;
   background:rgba(12,11,17,.82);border:1px solid rgba(255,255,255,.1);box-shadow:0 10px 28px rgba(0,0,0,.6)}
-.ne-thumb{width:150px;height:84px;margin-right:18px;border-radius:8px;flex:none;background-color:#1b2a38;
-  background-image:linear-gradient(135deg,#1b2a38,#2d3b45 55%,#3b2a21);background-position:center;background-size:cover}
 .ne-info{flex:1;min-width:0}
 .ne-kicker{font-size:15px;line-height:18px;letter-spacing:2px;color:rgba(255,255,255,.62);font-weight:700;margin-bottom:5px}
 .ne-title{font-size:21px;line-height:28px;font-weight:700;color:#fff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
@@ -402,8 +409,8 @@ body.page-loading .tab.focused .bar{background:#7B5BF5}
 .ne-progress{height:4px;margin-top:9px;width:0;border-radius:2px;background:#2ECC71;box-shadow:0 0 8px rgba(46,204,113,.6)}
 .ne-action{flex:none;margin-left:18px;padding:14px 20px;border-radius:10px;background:rgba(46,204,113,.7);color:#06210f;
   font-size:21px;font-weight:700;outline:none;pointer-events:auto;white-space:nowrap}
-/* Focus changes only the button: a slightly darker green plus the light ring. */
-.ne-action.focused{background:#25A85A;color:#fff;outline:4px solid #8DF2B1;outline-offset:3px;transform:scale(1.04)}
+/* Focus changes only the button background — no ring, arrow, checkmark or scaling. */
+.ne-action.focused{background:#2ECC71;outline:none;transform:none}
 .loading{position:absolute;left:50%;top:50%;width:80px;height:80px;margin:-40px;border:6px solid rgba(255,255,255,.2);border-top-color:#7B5BF5;border-radius:50%;animation:spin 1s linear infinite;display:none}
 .loading.show{display:block}
 
@@ -422,6 +429,15 @@ body.page-loading .tab.focused .bar{background:#7B5BF5}
 .tl-stat b.purple{color:#7B5BF5}
 /* Engine diagnostics line (red) hidden from the loading screen; still sent to the debug log. */
 .tl-diag{display:none}
+/* Pause scrim: 20% black over the picture, under the logo and controls. */
+.pause-underlay{position:absolute;left:0;top:0;width:1920px;height:1080px;background:rgba(0,0,0,.2);
+  pointer-events:none;opacity:0;transition:opacity .2s;z-index:1}
+.pause-underlay.show{opacity:1}
+/* API title logo: top-left inset of 100 px, 10% larger than the original art. */
+.paused-logo{position:absolute;left:100px;top:100px;width:1014px;height:264px;background-repeat:no-repeat;
+  background-position:left center;background-size:contain;pointer-events:none;opacity:0;
+  transition:opacity .2s;z-index:2}
+.paused-logo.show{opacity:1}
 @keyframes spin{to{transform:rotate(360deg)}}
 #keyboard-layer,#modal-layer{z-index:130}
 .subtitle{position:absolute;left:50%;bottom:180px;transform:translateX(-50%);width:1600px;text-align:center;

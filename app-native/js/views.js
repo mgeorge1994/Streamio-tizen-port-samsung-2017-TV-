@@ -469,7 +469,11 @@ var Views = (function () {
   }
 
   /* ---------------- BOARD ---------------- */
-  function board(box) {
+  function board(box, firstOpen) {
+    // On the very first launch the Home loading treatment stays up until the
+    // last-watched episode has been resolved into the Continue Watching row.
+    var holdHome = !!(firstOpen && App.holdHomeLoading);
+    if (holdHome) App.holdHomeLoading();
     clear(box);
     // Same layout as Discover, without the filters: the selected title's
     // details (#infobar) stay fixed and only the shelves below them scroll.
@@ -493,21 +497,11 @@ var Views = (function () {
       setBackdrop(item.background || item.poster || item.logo);
     };
 
-    // Continue Watching comes from local library/progress data, so it can be
-    // drawn immediately while the first catalogs are still in flight.
-    var saved = API.library(), progRows = [], upNext = [], cwRow = null;
-    for (var i = 0; i < saved.length; i++) {
-      var it = saved[i], p = API.progress(it.id);
-      if (p && p.pos >= 20 && !API.finished(p)) {
-        var o = badgeItem(it, it.type);
-        o.progress = Math.max(1, p.pct); o._at = p.at || it.lastWatched || 0; o._resume = true;
-        progRows.push(o);
-      } else if (it.type === 'series' && ((p && p.videoId) || it.videoId)) {
-        var localNewer = p && p.videoId && (p.at || 0) >= (it.lastWatched || 0);
-        upNext.push({ item: it, lastVid: localNewer ? p.videoId : (it.videoId || p.videoId),
-                      at: Math.max((p && p.at) || 0, it.lastWatched || 0) });
-      }
-    }
+    var rendered = [], catRowEls = [], gaveFocus = false, morePending = false, libDone = false,
+        libEl = null, skelDone = false, started = false;
+    var saved = [], progRows = [], upNext = [], cwRow = null;
+    var metaDone = false, catalogDone = false, imgLeft = 0, homeReadyDone = false, firstItem = null;
+
     function drawContinue() {
       // Most recently watched first, so movies and series interleave.
       progRows.sort(function (a, b) { return (b._at || 0) - (a._at || 0); });
@@ -526,34 +520,81 @@ var Views = (function () {
         if (nc.length) Focus.set(nc[Math.min(focusIdx, nc.length - 1)]);
       }
     }
-    drawContinue();
-    upNext.sort(function (a, b) { return b.at - a.at; });
-    upNext = upNext.slice(0, 12);          // most recent shows only
-    if (upNext.length) {
-      var upLeft = upNext.length;
-      function upDone() { if (--upLeft === 0) drawContinue(); }
-      for (var u = 0; u < upNext.length; u++) {
-        (function (un) {
-          API.getMeta('series', un.item.id, function (d) {
-            var nx = nextEpisode(d && d.meta, un.lastVid);
-            if (nx) {
-              var o2 = badgeItem(un.item, 'series');
-              o2.videoId = nx.id; o2._resume = true; o2._at = un.at; o2.progress = 0;
-              o2.name = (un.item.name || '') + '  \u2022  S' + nx.season + ' E' + nx.episode;
-              progRows.push(o2);
-            }
-            upDone();
-          }, upDone);
-        })(upNext[u]);
-      }
+
+    // First open reveals everything at once: account data, last-watched
+    // episode, initial catalog shelves, library shelf and their first images.
+    function finishHomeReady() {
+      if (!holdHome || homeReadyDone) return;
+      if (!metaDone || !catalogDone || imgLeft > 0) return;
+      homeReadyDone = true;
+      holdHome = false;
+      drawContinue();
+      if (!gaveFocus && firstItem) { gaveFocus = true; updateHero(firstItem); }
+      firstIn(page);
+      dropSkeleton();
+      if (App.releaseHomeLoading) App.releaseHomeLoading();
+    }
+    function maybeHomeReady() { if (holdHome) finishHomeReady(); }
+    function imageReady() { imgLeft--; maybeHomeReady(); }
+    function waitRow(row) {
+      if (!holdHome) { waitRowImages(row, dropSkeleton); return; }
+      imgLeft++;
+      waitRowImages(row, imageReady);
     }
 
-    // Rows are drawn as each catalog answers, not after all of them. Android TV
-    // does the same: 2 shelves at a time, queued when you approach the edge.
-    var rendered = [], catRowEls = [], gaveFocus = false, morePending = false, libDone = false,
-        libEl = null, skelDone = false;
+    function beginHome() {
+      if (started) return;
+      started = true;
+      saved = API.library();
+      for (var i = 0; i < saved.length; i++) {
+        var it = saved[i], p = API.progress(it.id);
+        if (p && p.pos >= 20 && !API.finished(p)) {
+          var o = badgeItem(it, it.type);
+          o.progress = Math.max(1, p.pct); o._at = p.at || it.lastWatched || 0; o._resume = true;
+          progRows.push(o);
+        } else if (it.type === 'series' && ((p && p.videoId) || it.videoId)) {
+          var localNewer = p && p.videoId && (p.at || 0) >= (it.lastWatched || 0);
+          upNext.push({ item: it, lastVid: localNewer ? p.videoId : (it.videoId || p.videoId),
+                        at: Math.max((p && p.at) || 0, it.lastWatched || 0) });
+        }
+      }
+      // Warm tab switches draw the local Continue Watching row immediately.
+      if (!holdHome) drawContinue();
+      upNext.sort(function (a, b) { return b.at - a.at; });
+      upNext = upNext.slice(0, 12);          // most recent shows only
+      if (upNext.length) {
+        var upLeft = upNext.length;
+        function upDone() {
+          if (--upLeft === 0) {
+            if (!holdHome) drawContinue();
+            metaDone = true;
+            maybeHomeReady();
+          }
+        }
+        for (var u = 0; u < upNext.length; u++) {
+          (function (un) {
+            API.getMeta('series', un.item.id, function (d) {
+              var nx = nextEpisode(d && d.meta, un.lastVid);
+              if (nx) {
+                var o2 = badgeItem(un.item, 'series');
+                o2.videoId = nx.id; o2._resume = true; o2._at = un.at; o2.progress = 0;
+                o2.name = (un.item.name || '') + '  \u2022  S' + nx.season + ' E' + nx.episode;
+                progRows.push(o2);
+              }
+              upDone();
+            }, upDone);
+          })(upNext[u]);
+        }
+      } else {
+        metaDone = true;
+        maybeHomeReady();
+      }
+      setTimeout(startLoad, 280);
+    }
+    if (holdHome && App.whenHomeDataReady) App.whenHomeDataReady(beginHome); else beginHome();
+
     function dropSkeleton() {
-      if (skelDone) return;
+      if (skelDone || holdHome) return;
       skelDone = true;
       var sk = rows.querySelectorAll('.sk-row');
       for (var s = 0; s < sk.length; s++) rows.removeChild(sk[s]);
@@ -564,12 +605,16 @@ var Views = (function () {
       var el = makeRow(rd.title, rd.items, rd.type, updateHero);
       catRowEls.push(el);
       if (libEl && libEl.parentNode) rows.insertBefore(el, libEl); else rows.appendChild(el);
-      waitRowImages(el, dropSkeleton);   // loader → images, never empty cards
+      waitRow(el);   // loader → images, never empty cards
       if (!gaveFocus) {
-        gaveFocus = true;
         var first = progRows[0] || (rd.items && rd.items[0] ? badgeItem(rd.items[0], rd.type) : null);
-        if (first) updateHero(first);
-        firstIn(page);
+        if (holdHome) {
+          firstItem = first;   // focus stays put until the loader lifts
+        } else {
+          gaveFocus = true;
+          if (first) updateHero(first);
+          firstIn(page);
+        }
       }
     }
     function addLibraryRow() {
@@ -580,6 +625,7 @@ var Views = (function () {
         libDone = true;
         libEl = makeRow('My Library', libRow, null, updateHero);
         rows.appendChild(libEl);
+        waitRow(libEl);
       }
     }
     function loadMore() {
@@ -606,14 +652,17 @@ var Views = (function () {
         if (!data.length) {
           clear(rows);
           rows.innerHTML = '<div class="empty">No catalogs available. Check your addons in Settings.</div>';
-          firstIn(page); return;
+          catalogDone = true;
+          maybeHomeReady();
+          return;
         }
         for (var j = 0; j < data.length; j++) appendRow(data[j]);
         addLibraryRow();
+        catalogDone = true;
+        maybeHomeReady();
       }, appendRow);
     }
     // Always show the shelves of placeholders, even on a warm cache visit.
-    // Android TV rebuilds its rows from state on every entry too.
     setTimeout(startLoad, 280);
   }
 
@@ -863,6 +912,7 @@ var Views = (function () {
     var results = U.qs('#search-results', page);
     function render(q, movies, series) {
       clear(results);
+      results.scrollTop = 0;   // a new query always starts at the Movies shelf
       if (movies.length) results.appendChild(makeRow('Movies', movies, 'movie', artFocus));
       if (series.length) results.appendChild(makeRow('Series', series, 'series', artFocus));
       if (!movies.length && !series.length) results.innerHTML = '<div class="empty">No results for “' + U.esc(q) + '”</div>';
@@ -910,6 +960,30 @@ var Views = (function () {
     if (!m) return null;
     return { series: m[1], season: parseInt(m[2], 10), episode: parseInt(m[3], 10) };
   }
+  // Newest watched episode id for a show, from saved progress first and then
+  // from the local watched timestamps. Used to open the right season tab when
+  // a series card in the Library is selected.
+  function lastWatchedEpisode(seriesId) {
+    var p = API.progress(seriesId), bestId = '', bestAt = 0, lib, w, k, e, at;
+    if (p && p.videoId) { bestId = p.videoId; bestAt = Number(p.at) || 0; }
+    else if (p && p.season && p.episode) {
+      bestId = seriesId + ':' + p.season + ':' + p.episode; bestAt = Number(p.at) || 0;
+    }
+    lib = API.inLibrary(seriesId);
+    if (!bestId && lib && lib.videoId) { bestId = lib.videoId; bestAt = Number(lib.lastWatched) || 0; }
+    else if (!bestId && lib && lib.season && lib.episode) {
+      bestId = seriesId + ':' + lib.season + ':' + lib.episode; bestAt = Number(lib.lastWatched) || 0;
+    }
+    w = API.watched() || {};
+    for (k in w) {
+      if (!w.hasOwnProperty(k) || !w[k]) continue;
+      e = episodeOf(k);
+      if (!e || e.series !== seriesId) continue;
+      at = Number(w[k]) || 0;
+      if (!bestId || at > bestAt) { bestId = k; bestAt = at; }
+    }
+    return bestId;
+  }
   function findVideo(d, season, episode) {
     var v = d.videos || [];
     for (var i = 0; i < v.length; i++) {
@@ -928,7 +1002,7 @@ var Views = (function () {
       for (var i = 0; i < metaData.videos.length; i++) {
         var v = metaData.videos[i];
         if (Number(v.season) === season && Number(v.episode) === episode) {
-          return name + ' — S' + season + ' E' + episode + (v.title ? '  •  ' + v.title : '');
+          return name + ' — S' + season + ' E' + episode + ((v.title || v.name) ? '  •  ' + (v.title || v.name) : '');
         }
       }
       return name + ' — S' + season + ' E' + episode;
@@ -1124,7 +1198,9 @@ var Views = (function () {
   }
 
   // Season tabs + episode grid, as in the Android TV details screen.
-  function renderEpisodes(body, d, seriesId) {
+  // `opts.seriesTab` is set on the series history entry when an episode or a
+  // season tab is opened, so Back restores the same tab instead of S1.
+  function renderEpisodes(body, d, seriesId, opts) {
     // Per-episode watched state. The series-level "Mark Watched" badge applies
     // to every episode; playback progress is keyed by the series id but stores
     // the exact episode in videoId.
@@ -1164,7 +1240,20 @@ var Views = (function () {
       if (b === 0) return -1;
       return a - b;
     });
+    function hasSeason(sn) {
+      for (var q = 0; q < seasons.length; q++) if (seasons[q] === sn) return true;
+      return false;
+    }
+    // Fresh open (e.g. from Library): land on the season of the last watched
+    // episode. Back from an episode uses the tab stored on the history entry.
+    var targetId = (opts && opts.seriesTab && opts.seriesTab.videoId) || lastWatchedEpisode(seriesId);
+    var targetEp = episodeOf(targetId);
     var initial = seasons[0];
+    if (opts && opts.seriesTab && hasSeason(Number(opts.seriesTab.season))) {
+      initial = Number(opts.seriesTab.season);
+    } else if (targetEp && hasSeason(targetEp.season)) {
+      initial = targetEp.season;
+    }
 
     var tabs = U.el('div', 'season-tabs');
     var grid = U.el('div', 'ep-grid');
@@ -1178,6 +1267,7 @@ var Views = (function () {
         (function (vid) {
           var card = U.el('div', 'ep-card');
           card.setAttribute('data-focus', '1');
+          card.setAttribute('data-vid', vid.id);
           var thumb = vid.thumbnail ? 'background-image:url(\'' + U.attr(vid.thumbnail) + '\')' : '';
           var date = String(vid.released || '').slice(0, 10);
           var st = epState(vid);
@@ -1190,9 +1280,12 @@ var Views = (function () {
           }
           card.innerHTML = '<div class="ep-thumb" style="' + thumb + '">' + marker +
             '<span class="ep-num">' + U.esc(epCode(vid)) + '</span></div>' +
-            '<div class="ep-name">' + U.esc(vid.title || ('Episode ' + vid.episode)) + '</div>' +
+            '<div class="ep-name">' + U.esc(vid.title || vid.name || ('Episode ' + vid.episode)) + '</div>' +
             '<div class="ep-date">' + U.esc(date) + '</div>';
-          card.onclick = function () { App.openMeta(vid.id, 'series', { fromContinue: true }); };
+          card.onclick = function () {
+            App.rememberSeriesTab(seriesId, Number(vid.season) || 0, vid.id);
+            App.openMeta(vid.id, 'series', { fromContinue: true });
+          };
           grid.appendChild(card);
         })(vids[v]);
       }
@@ -1208,6 +1301,7 @@ var Views = (function () {
             var f = (' ' + ts[q].className + ' ').indexOf(' focused ') !== -1 ? ' focused' : '';
             ts[q].className = 'st-tab' + (ts[q] === e ? ' active' : '') + f;
           }
+          App.rememberSeriesTab(seriesId, season, '');
           paint(season);
         }
         // Like the nav bar: moving focus onto a tab selects it.
@@ -1217,9 +1311,26 @@ var Views = (function () {
       })(seasons[t]);
     }
     paint(initial);
-    // Land on the first episode, not on the season strip.
-    var firstEp = grid.querySelector('.ep-card');
-    if (firstEp) Focus.set(firstEp);
+    // Land on the last watched episode in that season (or the first one),
+    // never on the season strip.
+    var cards = grid.querySelectorAll('.ep-card'), firstEp = cards[0];
+    for (var c = 0; c < cards.length; c++) {
+      if (cards[c].getAttribute('data-vid') === targetId) { firstEp = cards[c]; break; }
+    }
+    // The scroller gets its real height on a timer, so Focus.set() can run
+    // before it is scrollable. Re-assert visibility after both fit passes.
+    var scroller = grid.parentNode;
+    function ensureEpisodeVisible() {
+      if (!firstEp || !scroller || !document.body.contains(firstEp)) return;
+      var pr = scroller.getBoundingClientRect(), er = firstEp.getBoundingClientRect();
+      if (er.bottom > pr.bottom - 24) scroller.scrollTop += er.bottom - pr.bottom + 48;
+      else if (er.top < pr.top + 144) scroller.scrollTop -= (pr.top + 144 - er.top);
+    }
+    if (firstEp) {
+      Focus.set(firstEp);
+      setTimeout(ensureEpisodeVisible, 0);
+      setTimeout(ensureEpisodeVisible, 360);
+    }
   }
 
   function meta(box, id, type, opts) {
@@ -1246,7 +1357,7 @@ var Views = (function () {
       var sub = '';
       if (ep) {
         var v = findVideo(d, ep.season, ep.episode);
-        sub = '<span class="md-ep">' + U.esc(epCode(ep)) + (v && v.title ? '  •  ' + U.esc(v.title) : '') + '</span>  •  ';
+        sub = '<span class="md-ep">' + U.esc(epCode(ep)) + (v && (v.title || v.name) ? '  •  ' + U.esc(v.title || v.name) : '') + '</span>  •  ';
       }
       content.innerHTML =
         '<div class="md-title">' + U.esc(d.name || '') + '</div>' +
@@ -1319,7 +1430,7 @@ var Views = (function () {
       }
 
       if (ep) { openStreamsHere(); return; }                  // one specific episode
-      if (kindType === 'series' && d.videos && d.videos.length) { renderEpisodes(body, d, seriesId); return; }
+      if (kindType === 'series' && d.videos && d.videos.length) { renderEpisodes(body, d, seriesId, opts); return; }
       renderStreams(body, kindType, id, d);                   // movie
     }, function () {
       U.qs('#md-content', page).innerHTML = '<div class="empty">Could not load this item.</div>';

@@ -87,7 +87,10 @@ var Focus = (function () {
         if (snapRow) {
           // One category per screen: align the focused shelf with the top of
           // the scroll viewport, so up/down lands on a whole category.
-          p.scrollTop += (snapRow.getBoundingClientRect().top - pr.top);
+          // Search has a 120 px fade mask; keep the shelf title below it.
+          var shelfFade = hasClass(p, 'search-scroll') ? 120 :
+            (parseInt((p.getAttribute && p.getAttribute('data-fade-top')) || '0', 10) || 0);
+          p.scrollTop += (snapRow.getBoundingClientRect().top - pr.top) - shelfFade;
         } else {
           // Scroll containers with a faded top edge (data-fade-top) keep the
           // focused row -- including its title -- below the fade band.
@@ -215,6 +218,27 @@ var Focus = (function () {
     return false; // first/last shelf: let generic navigation handle it
   }
 
+  // Search: Down from the field, hint or any keyboard row jumps straight to
+  // the first result and lets set() scroll the Movies shelf into view.
+  function searchDownToResults(dir) {
+    if (dir !== 'down' || !current) return false;
+    var results = document.getElementById('search-results');
+    if (!results || !results.parentNode) return false;
+    var p = current;
+    while (p && p !== document.body) {
+      if (p === results) return false;   // already in results: let cardMove work
+      p = p.parentNode;
+    }
+    var pg = current;
+    while (pg && pg !== document.body && !hasClass(pg, 'page')) pg = pg.parentNode;
+    if (!pg || !pg.querySelector || !pg.querySelector('#search-input')) return false;
+    var first = results.querySelector('.card');
+    if (!first || !visible(first)) return false;
+    results.scrollTop = 0;
+    set(first);
+    return true;
+  }
+
   function move(dir) {
     if (!current || !visible(current)) { var l0 = candidates(); if (l0.length) set(l0[0]); return; }
 
@@ -260,23 +284,8 @@ var Focus = (function () {
       return;
     }
 
-    // On-screen keyboard (Search): Down from the bottom key row goes straight to
-    // the first result; with no results yet it stays on the keyboard. Explicit,
-    // so it never depends on geometry (the TV engine could land in the nav bar).
-    if (hasClass(current, 'kb-key') && dir === 'down') {
-      var kr = current.getBoundingClientRect(), keyBelow = false;
-      var keys = (root || document).querySelectorAll('.kb-key');
-      for (var kk = 0; kk < keys.length; kk++) {
-        if (!visible(keys[kk])) continue;
-        if (keys[kk].getBoundingClientRect().top > kr.top + kr.height / 2) { keyBelow = true; break; }
-      }
-      if (!keyBelow) {
-        var res = document.getElementById('search-results');
-        var firstCard = res ? res.querySelector('.card') : null;
-        if (firstCard && visible(firstCard)) set(firstCard);
-        return;
-      }
-    }
+    // Search owns Down until focus is already inside the results.
+    if (searchDownToResults(dir)) return;
 
     // Search: Up from the topmost result row returns to the search box and
     // scrolls the results back to the top of the page.
